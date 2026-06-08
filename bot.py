@@ -10,14 +10,14 @@ TG_CHAT    = os.getenv("TG_CHAT",  "5667140911")
 SCAN_EVERY = int(os.getenv("SCAN_EVERY", "60"))   # seconds between scans
 
 # Quality filters
-MIN_LIQ        = 10_000   # $10K min liquidity
-MIN_VOL_1H     = 2_000    # $2K min volume last hour
-MIN_HOLDERS    = 20       # min holders
-MIN_SCORE      = 70       # min RugCheck score
-MIN_LP_LOCKED  = 80       # min % LP locked
-BUY_SELL_RATIO = 1.3      # buyers must be 1.3x sellers
+MIN_LIQ        = 5_000    # $5K min liquidity
+MIN_VOL_1H     = 1_000    # $1K min volume last hour
+MIN_HOLDERS    = 10       # min holders
+MIN_SCORE      = 50       # min RugCheck score
+MIN_LP_LOCKED  = 60       # min % LP locked
+BUY_SELL_RATIO = 1.2      # buyers must be 1.2x sellers
 MAX_AGE_H      = 24       # max age in hours
-MIN_AGE_MIN    = 5        # min age in minutes
+MIN_AGE_MIN    = 3        # min age in minutes
 
 # ── LOGGING ─────────────────────────────────────────────────────────────────
 logging.basicConfig(
