@@ -10,12 +10,12 @@ TG_CHAT    = os.getenv("TG_CHAT",  "5667140911")
 HELIUS_KEY = os.getenv("HELIUS_KEY", "85dee6a1-d8e2-421e-8a26-33645c4a943f")
 SCAN_EVERY = int(os.getenv("SCAN_EVERY", "45"))
 
-# Market filters
-MIN_LIQ        = 5_000
-MIN_VOL_1H     = 500
-BUY_SELL_RATIO = 1.1
-MAX_AGE_H      = 6
-MIN_AGE_MIN    = 2
+# Market filters - Läge 2 (Balanserat)
+MIN_LIQ        = 3_000    # $3K min liquidity
+MIN_VOL_1H     = 300      # $300 vol last hour
+BUY_SELL_RATIO = 1.1      # buyers > sellers
+MAX_AGE_H      = 12       # max 12h old
+MIN_AGE_MIN    = 2        # min 2 min old
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s", datefmt="%H:%M:%S")
 log = logging.getLogger("pumpscan")
@@ -183,17 +183,19 @@ def safety_verdict(rc):
     if rc["lp_pct"] >= 80:
         passes.append(f"✓ LP Locked {rc['lp_pct']}%")
     elif rc["lp_pct"] >= 50:
-        fails.append(f"⚠️ LP delvis låst {rc['lp_pct']}%")
+        passes.append(f"✓ LP delvis låst {rc['lp_pct']}% — ok")
+    elif rc["lp_pct"] >= 20:
+        fails.append(f"⚠️ LP låst {rc['lp_pct']}% — lågt")
     else:
         fails.append(f"❌ LP EJ låst ({rc['lp_pct']}%) — rug pull risk!")
         critical_fail = True
 
     # 6. Top holder concentration
-    if rc["max_holder_pct"] > 20:
+    if rc["max_holder_pct"] > 30:
         fails.append(f"❌ En wallet äger {rc['max_holder_pct']:.1f}% — manipulation risk!")
         critical_fail = True
-    elif rc["max_holder_pct"] > 10:
-        fails.append(f"⚠️ En wallet äger {rc['max_holder_pct']:.1f}%")
+    elif rc["max_holder_pct"] > 15:
+        fails.append(f"⚠️ En wallet äger {rc['max_holder_pct']:.1f}% — håll koll")
     else:
         passes.append(f"✓ Ingen wallet äger för mycket")
 
@@ -204,12 +206,12 @@ def safety_verdict(rc):
         fails.append("⚠️ Creator håller tokens")
 
     # 8. RugCheck score
-    if rc["score"] >= 80:
+    if rc["score"] >= 70:
         passes.append(f"✓ Score {rc['score']}/100")
-    elif rc["score"] >= 60:
-        passes.append(f"✓ Score {rc['score']}/100")
-    elif rc["score"] >= 40:
-        fails.append(f"⚠️ Score {rc['score']}/100 — lågt")
+    elif rc["score"] >= 50:
+        passes.append(f"✓ Score {rc['score']}/100 — ok")
+    elif rc["score"] >= 30:
+        fails.append(f"⚠️ Score {rc['score']}/100 — lågt, kolla manuellt")
     else:
         fails.append(f"❌ Score {rc['score']}/100 — för lågt")
         critical_fail = True
@@ -311,10 +313,10 @@ async def analyze_and_notify(session, pair):
     # Market verdict
     if rc["score"] >= 70 and rc["lp_pct"] >= 80:
         market_verdict = "🔥 GO"
-    elif rc["score"] >= 50 and rc["lp_pct"] >= 50:
+    elif rc["score"] >= 50:
         market_verdict = "✅ GO"
     else:
-        market_verdict = "⚠️ WARN"
+        market_verdict = "⚠️ WARN — kolla manuellt på RugCheck!"
 
     momentum_v, momentum_s = momentum_signal(pct5m, pct1h, buys, sells, vol1h)
 
