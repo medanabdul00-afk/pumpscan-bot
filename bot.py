@@ -3,22 +3,19 @@ import aiohttp
 import logging
 import os
 import time
-import json
 
 # ── CONFIG ───────────────────────────────────────────────────────────────────
-TG_TOKEN     = os.getenv("TG_TOKEN", "8908814441:AAGFGs52sINf_LjU6Mt6YP_yCcEZvQflhqM")
-TG_CHAT      = os.getenv("TG_CHAT",  "5667140911")
-HELIUS_KEY   = os.getenv("HELIUS_KEY", "85dee6a1-d8e2-421e-8a26-33645c4a943f")
-SCAN_EVERY   = int(os.getenv("SCAN_EVERY", "45"))
+TG_TOKEN   = os.getenv("TG_TOKEN", "8908814441:AAGFGs52sINf_LjU6Mt6YP_yCcEZvQflhqM")
+TG_CHAT    = os.getenv("TG_CHAT",  "5667140911")
+HELIUS_KEY = os.getenv("HELIUS_KEY", "85dee6a1-d8e2-421e-8a26-33645c4a943f")
+SCAN_EVERY = int(os.getenv("SCAN_EVERY", "45"))
 
-# Filters
-MIN_LIQ        = 3_000
-MIN_VOL_1H     = 300
-MIN_SCORE      = 40
-MIN_LP_LOCKED  = 50
+# Market filters
+MIN_LIQ        = 5_000
+MIN_VOL_1H     = 500
 BUY_SELL_RATIO = 1.1
 MAX_AGE_H      = 6
-MIN_AGE_MIN    = 1
+MIN_AGE_MIN    = 2
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s", datefmt="%H:%M:%S")
 log = logging.getLogger("pumpscan")
@@ -37,56 +34,6 @@ def age_min(ts):
     t = ts if isinstance(ts, (int, float)) else 0
     return (time.time()*1000 - t) / 60_000
 
-def momentum_signal(pct5m, pct1h, buys, sells, vol1h):
-    signals = []
-    score = 0
-    if pct5m > 5:
-        signals.append(f"📈 +{pct5m:.1f}% senaste 5 min — starkt momentum")
-        score += 2
-    elif pct5m > 0:
-        signals.append(f"📈 +{pct5m:.1f}% senaste 5 min")
-        score += 1
-    elif pct5m < -10:
-        signals.append(f"📉 {pct5m:.1f}% senaste 5 min — varning!")
-        score -= 2
-    elif pct5m < 0:
-        signals.append(f"📉 {pct5m:.1f}% senaste 5 min")
-        score -= 1
-
-    ratio = buys / max(sells, 1)
-    if ratio >= 2:
-        signals.append(f"🟢 {buys} köp vs {sells} sälj — starkt köptryck ({ratio:.1f}x)")
-        score += 2
-    elif ratio >= 1.3:
-        signals.append(f"🟢 {buys} köp vs {sells} sälj — bra ratio ({ratio:.1f}x)")
-        score += 1
-    elif ratio < 0.8:
-        signals.append(f"🔴 {buys} köp vs {sells} sälj — säljtryck!")
-        score -= 2
-    else:
-        signals.append(f"🟡 {buys} köp vs {sells} sälj — neutralt ({ratio:.1f}x)")
-
-    if vol1h >= 50_000:
-        signals.append(f"🔥 Vol {fmt(vol1h)} — mycket aktiv")
-        score += 2
-    elif vol1h >= 10_000:
-        signals.append(f"✅ Vol {fmt(vol1h)} — aktiv")
-        score += 1
-    elif vol1h < 500:
-        signals.append(f"⚠️ Vol {fmt(vol1h)} — låg aktivitet")
-        score -= 1
-
-    if score >= 4:
-        verdict = "🔥 STARKT BULLISH — bra entry just nu"
-    elif score >= 2:
-        verdict = "✅ BULLISH — rimlig entry"
-    elif score >= 0:
-        verdict = "🟡 NEUTRAL — vänta och se"
-    else:
-        verdict = "🔴 BEARISH — undvik just nu"
-
-    return verdict, signals
-
 async def send_tg(session, msg):
     try:
         async with session.post(
@@ -94,55 +41,238 @@ async def send_tg(session, msg):
             json={"chat_id": TG_CHAT, "text": msg, "parse_mode": "Markdown", "disable_web_page_preview": False},
             timeout=aiohttp.ClientTimeout(total=10)
         ) as r:
-            if r.status == 200:
-                log.info("📱 Telegram skickad!")
-            else:
+            if r.status != 200:
                 log.warning(f"TG fel {r.status}: {await r.text()}")
+            else:
+                log.info("📱 Telegram skickad!")
     except Exception as e:
         log.warning(f"TG exception: {e}")
 
-async def get_rugcheck(session, addr):
+async def full_rugcheck(session, addr):
+    """
+    Fetch FULL RugCheck report and extract ALL safety flags.
+    Returns dict with all critical safety data, or None on error.
+    """
     try:
+        # Use full report endpoint, not just summary
         async with session.get(
-            f"https://api.rugcheck.xyz/v1/tokens/{addr}/report/summary",
-            timeout=aiohttp.ClientTimeout(total=8)
+            f"https://api.rugcheck.xyz/v1/tokens/{addr}/report",
+            timeout=aiohttp.ClientTimeout(total=10)
         ) as r:
-            if r.status != 200: return None
+            if r.status != 200:
+                log.warning(f"RugCheck HTTP {r.status} for {addr[:12]}")
+                return None
             d = await r.json(content_type=None)
+
+        # ── CRITICAL SAFETY FLAGS ─────────────────────────────────────────
+        # These alone = instant NOGO regardless of score
+
+        # 1. Freeze authority — can someone freeze your tokens?
+        freeze_auth = d.get("freezeAuthority") or d.get("freeze_authority")
+        has_freeze = freeze_auth is not None and freeze_auth != "" and freeze_auth != "null"
+
+        # 2. Mint authority — can creator print more tokens and dump?
+        mint_auth = d.get("mintAuthority") or d.get("mint_authority")
+        has_mint = mint_auth is not None and mint_auth != "" and mint_auth != "null"
+
+        # 3. Mutable metadata — can contract be changed after deploy?
+        mutable = d.get("mutableMetadata") or d.get("mutable_metadata") or False
+
+        # 4. Top holder concentration — does one wallet own too much?
+        top_holders = d.get("topHolders") or d.get("top_holders") or []
+        max_holder_pct = 0
+        if top_holders:
+            # Exclude LP pool from calculation
+            non_lp = [h for h in top_holders if not h.get("isLpHolder") and not h.get("is_lp_holder")]
+            if non_lp:
+                max_holder_pct = max(h.get("pct", 0) or h.get("percentage", 0) for h in non_lp)
+
+        # 5. LP locked %
+        lp_pct = 0
+        markets = d.get("markets") or []
+        if markets:
+            lp_pct = markets[0].get("lpLockedPct") or markets[0].get("lp_locked_pct") or 0
+            lp_pct = min(100, round(float(lp_pct)))
+        if not lp_pct:
+            lp_pct_direct = d.get("lpLockedPct") or d.get("lp_locked_pct") or 0
+            lp_pct = min(100, round(float(lp_pct_direct)))
+
+        # 6. Creator balance
+        creator_sold = (
+            d.get("creatorBalance") == "SOLD" or
+            d.get("creator_balance") == "SOLD" or
+            (isinstance(d.get("creatorTokens"), (int, float)) and d["creatorTokens"] == 0)
+        )
+
+        # 7. Overall score
         score = 0
         if isinstance(d.get("score"), (int, float)):
             score = min(100, max(0, round(d["score"])))
         elif isinstance(d.get("score_normalised"), (int, float)):
             score = min(100, max(0, round(d["score_normalised"])))
-        elif isinstance(d.get("risks"), list):
-            score = max(0, 100 - len(d["risks"]) * 10)
-        lp = 0
-        if isinstance(d.get("lpLockedPct"), (int, float)):
-            lp = min(100, round(d["lpLockedPct"]))
-        elif d.get("markets") and isinstance(d["markets"][0].get("lpLockedPct"), (int, float)):
-            lp = min(100, round(d["markets"][0]["lpLockedPct"]))
-        creator_sold = d.get("creatorBalance") == "SOLD"
-        return {"score": score, "lp": lp, "creator_sold": creator_sold}
-    except:
+
+        # 8. Parse risks list for specific danger flags
+        risks = d.get("risks") or []
+        risk_names = [r.get("name", "").lower() for r in risks]
+        risk_levels = {r.get("name", "").lower(): r.get("level", "").lower() for r in risks}
+
+        has_freeze_risk = any("freeze" in r for r in risk_names)
+        has_mint_risk = any("mint" in r for r in risk_names)
+        is_honeypot = any("honeypot" in r for r in risk_names)
+        high_risks = [r for r in risks if r.get("level", "").lower() == "danger"]
+
+        # Combine freeze/mint detection
+        freeze_danger = has_freeze or has_freeze_risk
+        mint_danger = has_mint or has_mint_risk
+
+        return {
+            "score": score,
+            "lp_pct": lp_pct,
+            "creator_sold": creator_sold,
+            "freeze_authority": freeze_danger,
+            "mint_authority": mint_danger,
+            "mutable_metadata": mutable,
+            "max_holder_pct": max_holder_pct,
+            "is_honeypot": is_honeypot,
+            "high_risks": high_risks,
+            "risk_count": len(risks),
+        }
+
+    except Exception as e:
+        log.warning(f"RugCheck exception {addr[:12]}: {e}")
         return None
 
-async def get_pair_for_token(session, addr):
-    try:
-        async with session.get(
-            f"https://api.dexscreener.com/latest/dex/tokens/{addr}",
-            timeout=aiohttp.ClientTimeout(total=10)
-        ) as r:
-            if r.status != 200: return None
-            d = await r.json(content_type=None)
-            pairs = [p for p in (d.get("pairs") or []) if p.get("chainId") == "solana"]
-            if not pairs: return None
-            return max(pairs, key=lambda p: (p.get("liquidity") or {}).get("usd", 0) or 0)
-    except:
-        return None
+def safety_verdict(rc):
+    """
+    Returns (is_safe, verdict, pass_list, fail_list)
+    ANY critical flag = instant NOGO
+    """
+    passes = []
+    fails = []
+    critical_fail = False
+
+    # 1. Freeze authority — CRITICAL
+    if rc["freeze_authority"]:
+        fails.append("❌ FREEZE AUTHORITY aktiv — kan frysa dina tokens!")
+        critical_fail = True
+    else:
+        passes.append("✓ Ingen freeze authority")
+
+    # 2. Mint authority — CRITICAL
+    if rc["mint_authority"]:
+        fails.append("❌ MINT AUTHORITY aktiv — kan skapa fler tokens!")
+        critical_fail = True
+    else:
+        passes.append("✓ Ingen mint authority")
+
+    # 3. Honeypot — CRITICAL
+    if rc["is_honeypot"]:
+        fails.append("❌ HONEYPOT — kan inte sälja!")
+        critical_fail = True
+    else:
+        passes.append("✓ Inte honeypot")
+
+    # 4. Mutable metadata — CRITICAL
+    if rc["mutable_metadata"]:
+        fails.append("⚠️ Metadata kan ändras")
+        critical_fail = True
+    else:
+        passes.append("✓ Metadata låst")
+
+    # 5. LP locked
+    if rc["lp_pct"] >= 80:
+        passes.append(f"✓ LP Locked {rc['lp_pct']}%")
+    elif rc["lp_pct"] >= 50:
+        fails.append(f"⚠️ LP delvis låst {rc['lp_pct']}%")
+    else:
+        fails.append(f"❌ LP EJ låst ({rc['lp_pct']}%) — rug pull risk!")
+        critical_fail = True
+
+    # 6. Top holder concentration
+    if rc["max_holder_pct"] > 20:
+        fails.append(f"❌ En wallet äger {rc['max_holder_pct']:.1f}% — manipulation risk!")
+        critical_fail = True
+    elif rc["max_holder_pct"] > 10:
+        fails.append(f"⚠️ En wallet äger {rc['max_holder_pct']:.1f}%")
+    else:
+        passes.append(f"✓ Ingen wallet äger för mycket")
+
+    # 7. Creator sold
+    if rc["creator_sold"]:
+        passes.append("✓ Creator SOLD")
+    else:
+        fails.append("⚠️ Creator håller tokens")
+
+    # 8. RugCheck score
+    if rc["score"] >= 80:
+        passes.append(f"✓ Score {rc['score']}/100")
+    elif rc["score"] >= 60:
+        passes.append(f"✓ Score {rc['score']}/100")
+    elif rc["score"] >= 40:
+        fails.append(f"⚠️ Score {rc['score']}/100 — lågt")
+    else:
+        fails.append(f"❌ Score {rc['score']}/100 — för lågt")
+        critical_fail = True
+
+    # 9. High risk count
+    if len(rc["high_risks"]) > 0:
+        risk_names = ", ".join([r.get("name", "?") for r in rc["high_risks"][:3]])
+        fails.append(f"❌ {len(rc['high_risks'])} DANGER-risker: {risk_names}")
+        critical_fail = True
+
+    is_safe = not critical_fail
+    return is_safe, passes, fails
+
+def momentum_signal(pct5m, pct1h, buys, sells, vol1h):
+    signals = []
+    score = 0
+
+    if pct5m > 5:
+        signals.append(f"📈 +{pct5m:.1f}% senaste 5 min — starkt")
+        score += 2
+    elif pct5m > 0:
+        signals.append(f"📈 +{pct5m:.1f}% senaste 5 min")
+        score += 1
+    elif pct5m < -10:
+        signals.append(f"📉 {pct5m:.1f}% senaste 5 min — varning!")
+        score -= 2
+    else:
+        signals.append(f"📉 {pct5m:.1f}% senaste 5 min")
+        score -= 1
+
+    ratio = buys / max(sells, 1)
+    if ratio >= 2:
+        signals.append(f"🟢 {buys} köp vs {sells} sälj ({ratio:.1f}x) — starkt")
+        score += 2
+    elif ratio >= 1.3:
+        signals.append(f"🟢 {buys} köp vs {sells} sälj ({ratio:.1f}x)")
+        score += 1
+    elif ratio < 0.8:
+        signals.append(f"🔴 {buys} köp vs {sells} sälj — säljtryck!")
+        score -= 2
+    else:
+        signals.append(f"🟡 {buys} köp vs {sells} sälj ({ratio:.1f}x) — neutralt")
+
+    if vol1h >= 50_000:
+        signals.append(f"🔥 Vol {fmt(vol1h)} — mycket aktiv")
+        score += 2
+    elif vol1h >= 10_000:
+        signals.append(f"✅ Vol {fmt(vol1h)} — aktiv")
+        score += 1
+    else:
+        signals.append(f"⚠️ Vol {fmt(vol1h)} — låg")
+
+    if score >= 4: verdict = "🔥 STARKT BULLISH — bra entry"
+    elif score >= 2: verdict = "✅ BULLISH — rimlig entry"
+    elif score >= 0: verdict = "🟡 NEUTRAL — vänta"
+    else: verdict = "🔴 BEARISH — undvik"
+
+    return verdict, signals
 
 async def analyze_and_notify(session, pair):
     addr   = (pair.get("baseToken") or {}).get("address", "")
     if not addr or addr in notified: return
+
     name   = (pair.get("baseToken") or {}).get("name", "?")
     ticker = (pair.get("baseToken") or {}).get("symbol", "?")
     liq    = (pair.get("liquidity") or {}).get("usd", 0) or 0
@@ -157,93 +287,64 @@ async def analyze_and_notify(session, pair):
     pct24h = (pair.get("priceChange") or {}).get("h24", 0) or 0
     ratio  = buys / max(sells, 1)
 
+    # Basic filters
     if age < MIN_AGE_MIN or age > MAX_AGE_H * 60: return
     if liq < MIN_LIQ or vol1h < MIN_VOL_1H: return
+    if ratio < BUY_SELL_RATIO: return
 
-    log.info(f"🛡 RugCheck: {name} age={age:.0f}min liq={fmt(liq)} vol={fmt(vol1h)}")
-    rc = await get_rugcheck(session, addr)
+    log.info(f"🛡 RugCheck FULL: {name} age={age:.0f}min liq={fmt(liq)}")
+    rc = await full_rugcheck(session, addr)
     await asyncio.sleep(0.5)
 
-    score = rc["score"] if rc else 0
-    lp    = rc["lp"] if rc else 0
-    creator_sold = rc["creator_sold"] if rc else False
-
-    log.info(f"  → score={score} lp={lp}% ratio={ratio:.1f}x")
-
-    if score >= MIN_SCORE and lp >= MIN_LP_LOCKED and ratio >= BUY_SELL_RATIO:
-        verdict = "🔥 GO" if score >= 70 else "✅ GO"
-    elif score >= MIN_SCORE and ratio >= BUY_SELL_RATIO:
-        verdict = "⚠️ WARN"
-    else:
-        log.info(f"  → NOGO (score:{score} lp:{lp}% ratio:{ratio:.1f}x)")
+    if not rc:
+        log.info(f"  → Ingen RugCheck data för {name} — skippar")
         return
 
-    momentum_verdict, momentum_signals = momentum_signal(pct5m, pct1h, buys, sells, vol1h)
+    is_safe, passes, fails = safety_verdict(rc)
 
-    checks = []
-    if score >= MIN_SCORE: checks.append(f"✓ Score {score}/100")
-    else: checks.append(f"✗ Score {score}/100")
-    if lp >= MIN_LP_LOCKED: checks.append(f"✓ LP {lp}%")
-    else: checks.append(f"✗ LP {lp}%")
-    if ratio >= BUY_SELL_RATIO: checks.append(f"✓ Köp/sälj {ratio:.1f}x")
-    else: checks.append(f"✗ Ratio {ratio:.1f}x")
-    if creator_sold: checks.append("✓ Creator SOLD")
-    else: checks.append("⚠ Creator håller")
+    log.info(f"  → safe={is_safe} score={rc['score']} lp={rc['lp_pct']}% freeze={rc['freeze_authority']} mint={rc['mint_authority']}")
+
+    if not is_safe:
+        log.info(f"  → NOGO pga säkerhetsproblem: {[f for f in fails if '❌' in f]}")
+        return
+
+    # Market verdict
+    if rc["score"] >= 70 and rc["lp_pct"] >= 80:
+        market_verdict = "🔥 GO"
+    elif rc["score"] >= 50 and rc["lp_pct"] >= 50:
+        market_verdict = "✅ GO"
+    else:
+        market_verdict = "⚠️ WARN"
+
+    momentum_v, momentum_s = momentum_signal(pct5m, pct1h, buys, sells, vol1h)
 
     msg = (
-        f"{verdict}: *{name}* (${ticker})\n"
+        f"{market_verdict}: *{name}* (${ticker})\n"
         f"⏱ {age:.0f} min gammal\n\n"
         f"💰 MCap: {fmt(mcap)}\n"
         f"💧 Liq: {fmt(liq)}\n"
         f"📈 Vol 1h: {fmt(vol1h)} | 24h: {fmt(vol24h)}\n"
         f"📊 Pris 1h: {'+' if pct1h>=0 else ''}{pct1h:.1f}% | 5min: {'+' if pct5m>=0 else ''}{pct5m:.1f}%\n"
-        f"🔄 Buys/Sells: {buys}/{sells}\n"
-        f"🛡 Score: {score}/100 | LP: {lp}%\n\n"
-        f"📊 *CHARTANALYS:*\n"
-        f"{momentum_verdict}\n"
-        + "\n".join(momentum_signals) +
-        f"\n\n🔐 *SÄKERHETSCHECK:*\n"
-        + "\n".join(checks) +
+        f"🔄 Buys/Sells: {buys}/{sells}\n\n"
+        f"🔐 *SÄKERHETSKONTROLL:*\n"
+        + "\n".join(passes + fails) +
+        f"\n\n📊 *CHARTANALYS:*\n"
+        f"{momentum_v}\n"
+        + "\n".join(momentum_s) +
         f"\n\n🎯 Entry: Nu om momentum håller\n"
         f"🛑 Stop loss: −20%\n"
         f"💰 Target: +50–100%\n\n"
         f"🔗 [Dexscreener](https://dexscreener.com/solana/{addr})\n"
         f"🔍 [RugCheck](https://rugcheck.xyz/tokens/{addr})\n"
         f"🟣 [Pump.fun](https://pump.fun/{addr})\n\n"
-        f"⚡ _PumpScan Bot v3_"
+        f"⚡ _PumpScan Bot v4_"
     )
 
     notified.add(addr)
     await send_tg(session, msg)
-    log.info(f"  → {verdict} skickad för {name}!")
-
-async def helius_new_tokens(session):
-    """Use Helius to get newly created tokens via enhanced API."""
-    url = f"https://api.helius.xyz/v0/addresses/TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA/transactions?api-key={HELIUS_KEY}&type=CREATE_ACCOUNT&limit=20"
-    while True:
-        try:
-            log.info("⚡ Helius — hämtar nya tokens...")
-            async with session.get(url, timeout=aiohttp.ClientTimeout(total=15)) as r:
-                if r.status == 200:
-                    txns = await r.json(content_type=None)
-                    log.info(f"  → {len(txns)} transaktioner från Helius")
-                    for txn in txns:
-                        for acc in txn.get("accountData", []):
-                            addr = acc.get("account", "")
-                            if addr and addr not in notified and addr not in last_check:
-                                last_check[addr] = time.time()
-                                await asyncio.sleep(20)  # wait for liquidity
-                                pair = await get_pair_for_token(session, addr)
-                                if pair:
-                                    await analyze_and_notify(session, pair)
-                else:
-                    log.warning(f"Helius HTTP {r.status}")
-        except Exception as e:
-            log.warning(f"Helius fel: {e}")
-        await asyncio.sleep(30)
+    log.info(f"  → {market_verdict} skickad för {name}!")
 
 async def dex_scan_loop(session):
-    """Backup Dexscreener scan every 45s."""
     while True:
         try:
             log.info("🔍 Dexscreener scan...")
@@ -306,23 +407,23 @@ async def dex_scan_loop(session):
         await asyncio.sleep(SCAN_EVERY)
 
 async def main():
-    log.info("🚀 PumpScan Bot v3 startar...")
+    log.info("🚀 PumpScan Bot v4 startar...")
     conn = aiohttp.TCPConnector(limit=10, ssl=False)
     async with aiohttp.ClientSession(connector=conn) as session:
         await send_tg(session,
-            "🤖 *PumpScan Bot v3 startad!*\n\n"
-            "⚡ Helius API — nya tokens snabbt\n"
-            "📊 Automatisk chartanalys\n"
-            "🔍 Dexscreener backup var 45s\n\n"
-            f"💧 Min liq: {fmt(MIN_LIQ)}\n"
-            f"🛡 Min score: {MIN_SCORE}\n"
-            f"⏱ Ålder: {MIN_AGE_MIN}min–{MAX_AGE_H}h\n\n"
-            "⚡ _PumpScan Bot v3_"
+            "🤖 *PumpScan Bot v4 startad!*\n\n"
+            "🔐 *Nya säkerhetskontroller:*\n"
+            "✓ Freeze authority check\n"
+            "✓ Mint authority check\n"
+            "✓ Honeypot check\n"
+            "✓ Mutable metadata check\n"
+            "✓ Top holder koncentration\n"
+            "✓ LP locked check\n"
+            "✓ DANGER-risker blockeras\n\n"
+            "Ingen coin med kritiska risker skickas till dig!\n\n"
+            "⚡ _PumpScan Bot v4_"
         )
-        await asyncio.gather(
-            helius_new_tokens(session),
-            dex_scan_loop(session),
-        )
+        await dex_scan_loop(session)
 
 if __name__ == "__main__":
     asyncio.run(main())
