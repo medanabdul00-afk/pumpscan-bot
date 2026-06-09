@@ -22,6 +22,7 @@ log = logging.getLogger("pumpscan")
 
 notified   = set()
 last_check = {}
+RECHECK_AFTER = 600  # recheck coins after 10 min
 
 def fmt(n):
     if not n: return "N/A"
@@ -353,6 +354,8 @@ async def dex_scan_loop(session):
             searches = [
                 "https://api.dexscreener.com/latest/dex/search?q=pump.fun",
                 "https://api.dexscreener.com/latest/dex/search?q=pumpswap",
+                "https://api.dexscreener.com/latest/dex/search?q=solana+meme",
+                "https://api.dexscreener.com/latest/dex/search?q=solana+new",
                 "https://api.dexscreener.com/token-boosts/latest/v1",
                 "https://api.dexscreener.com/token-profiles/latest/v1",
             ]
@@ -386,11 +389,19 @@ async def dex_scan_loop(session):
 
             seen = set()
             now = time.time()
+
+            # Auto-clear last_check older than 30 min so we don't miss coins
+            expired = [a for a, t in list(last_check.items()) if now - t > 1800 and a not in notified]
+            for a in expired:
+                del last_check[a]
+            if expired:
+                log.info(f"🧹 Rensade {len(expired)} gamla entries")
+
             fresh = []
             for p in all_pairs:
                 addr = (p.get("baseToken") or {}).get("address", "")
                 if not addr or addr in seen or addr in notified: continue
-                if now - last_check.get(addr, 0) < 1200: continue
+                if now - last_check.get(addr, 0) < RECHECK_AFTER: continue
                 seen.add(addr)
                 age = age_min(p.get("pairCreatedAt"))
                 liq = (p.get("liquidity") or {}).get("usd", 0) or 0
