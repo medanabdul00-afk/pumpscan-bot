@@ -3,40 +3,90 @@ import aiohttp
 import logging
 import os
 import time
-from datetime import datetime, timezone
- 
+import json
+
 # ── CONFIG ───────────────────────────────────────────────────────────────────
-TG_TOKEN   = os.getenv("TG_TOKEN", "8908814441:AAGFGs52sINf_LjU6Mt6YP_yCcEZvQflhqM")
-TG_CHAT    = os.getenv("TG_CHAT",  "5667140911")
-SCAN_EVERY = int(os.getenv("SCAN_EVERY", "60"))
- 
-# Filters - balanced for real coins
-MIN_LIQ        = 5_000    # $5K liquidity
-MIN_VOL_1H     = 500      # $500 vol last hour
-MIN_SCORE      = 40       # rugcheck score
-MIN_LP_LOCKED  = 50       # % LP locked
-BUY_SELL_RATIO = 1.1      # buyers > sellers
-MAX_AGE_H      = 12       # max 12h old
-MIN_AGE_MIN    = 2        # min 2 min old
- 
+TG_TOKEN     = os.getenv("TG_TOKEN", "8908814441:AAGFGs52sINf_LjU6Mt6YP_yCcEZvQflhqM")
+TG_CHAT      = os.getenv("TG_CHAT",  "5667140911")
+HELIUS_KEY   = os.getenv("HELIUS_KEY", "85dee6a1-d8e2-421e-8a26-33645c4a943f")
+SCAN_EVERY   = int(os.getenv("SCAN_EVERY", "45"))
+
+# Filters
+MIN_LIQ        = 3_000
+MIN_VOL_1H     = 300
+MIN_SCORE      = 40
+MIN_LP_LOCKED  = 50
+BUY_SELL_RATIO = 1.1
+MAX_AGE_H      = 6
+MIN_AGE_MIN    = 1
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s", datefmt="%H:%M:%S")
 log = logging.getLogger("pumpscan")
- 
-# State
-notified = set()  # never notify same coin twice
-last_checked = {}  # addr -> timestamp
- 
+
+notified   = set()
+last_check = {}
+
 def fmt(n):
     if not n: return "N/A"
     if n >= 1e6: return f"${n/1e6:.1f}M"
     if n >= 1e3: return f"${n/1e3:.1f}K"
     return f"${n:.0f}"
- 
+
 def age_min(ts):
     if not ts: return 9999
     t = ts if isinstance(ts, (int, float)) else 0
     return (time.time()*1000 - t) / 60_000
- 
+
+def momentum_signal(pct5m, pct1h, buys, sells, vol1h):
+    signals = []
+    score = 0
+    if pct5m > 5:
+        signals.append(f"📈 +{pct5m:.1f}% senaste 5 min — starkt momentum")
+        score += 2
+    elif pct5m > 0:
+        signals.append(f"📈 +{pct5m:.1f}% senaste 5 min")
+        score += 1
+    elif pct5m < -10:
+        signals.append(f"📉 {pct5m:.1f}% senaste 5 min — varning!")
+        score -= 2
+    elif pct5m < 0:
+        signals.append(f"📉 {pct5m:.1f}% senaste 5 min")
+        score -= 1
+
+    ratio = buys / max(sells, 1)
+    if ratio >= 2:
+        signals.append(f"🟢 {buys} köp vs {sells} sälj — starkt köptryck ({ratio:.1f}x)")
+        score += 2
+    elif ratio >= 1.3:
+        signals.append(f"🟢 {buys} köp vs {sells} sälj — bra ratio ({ratio:.1f}x)")
+        score += 1
+    elif ratio < 0.8:
+        signals.append(f"🔴 {buys} köp vs {sells} sälj — säljtryck!")
+        score -= 2
+    else:
+        signals.append(f"🟡 {buys} köp vs {sells} sälj — neutralt ({ratio:.1f}x)")
+
+    if vol1h >= 50_000:
+        signals.append(f"🔥 Vol {fmt(vol1h)} — mycket aktiv")
+        score += 2
+    elif vol1h >= 10_000:
+        signals.append(f"✅ Vol {fmt(vol1h)} — aktiv")
+        score += 1
+    elif vol1h < 500:
+        signals.append(f"⚠️ Vol {fmt(vol1h)} — låg aktivitet")
+        score -= 1
+
+    if score >= 4:
+        verdict = "🔥 STARKT BULLISH — bra entry just nu"
+    elif score >= 2:
+        verdict = "✅ BULLISH — rimlig entry"
+    elif score >= 0:
+        verdict = "🟡 NEUTRAL — vänta och se"
+    else:
+        verdict = "🔴 BEARISH — undvik just nu"
+
+    return verdict, signals
+
 async def send_tg(session, msg):
     try:
         async with session.post(
@@ -50,7 +100,7 @@ async def send_tg(session, msg):
                 log.warning(f"TG fel {r.status}: {await r.text()}")
     except Exception as e:
         log.warning(f"TG exception: {e}")
- 
+
 async def get_rugcheck(session, addr):
     try:
         async with session.get(
@@ -75,188 +125,204 @@ async def get_rugcheck(session, addr):
         return {"score": score, "lp": lp, "creator_sold": creator_sold}
     except:
         return None
- 
-async def fetch_pairs(session):
-    """Fetch from multiple Dexscreener endpoints to get diverse coins."""
-    all_pairs = []
-    
-    # Multiple search queries to get different coins
-    searches = [
-        "https://api.dexscreener.com/latest/dex/search?q=pump.fun",
-        "https://api.dexscreener.com/latest/dex/search?q=pumpswap",
-        "https://api.dexscreener.com/latest/dex/search?q=solana meme",
-        "https://api.dexscreener.com/latest/dex/search?q=sol token",
-        "https://api.dexscreener.com/token-boosts/latest/v1",
-        "https://api.dexscreener.com/token-profiles/latest/v1",
-    ]
-    
-    for url in searches:
-        try:
-            async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as r:
-                if r.status != 200: continue
-                d = await r.json(content_type=None)
-                if isinstance(d, list):
-                    for item in d:
-                        chain = item.get("chainId") or item.get("chain", "")
-                        if chain == "solana":
-                            # Token profile - need to fetch pair data
-                            addr = item.get("tokenAddress") or item.get("address", "")
-                            if addr:
-                                try:
-                                    async with session.get(f"https://api.dexscreener.com/latest/dex/tokens/{addr}", timeout=aiohttp.ClientTimeout(total=8)) as r2:
-                                        if r2.status == 200:
-                                            d2 = await r2.json(content_type=None)
-                                            all_pairs.extend([p for p in (d2.get("pairs") or []) if p.get("chainId") == "solana"])
-                                except: pass
-                else:
-                    pairs = d.get("pairs") or []
-                    all_pairs.extend([p for p in pairs if p.get("chainId") == "solana"])
-        except Exception as e:
-            log.warning(f"Fetch error {url}: {e}")
-        await asyncio.sleep(0.3)
- 
-    # Deduplicate
-    seen = set()
-    unique = []
-    for p in all_pairs:
-        addr = (p.get("baseToken") or {}).get("address", "")
-        if addr and addr not in seen:
-            seen.add(addr)
-            unique.append(p)
-    
-    return unique
- 
-async def scan(session):
-    log.info("🔍 Startar scan...")
-    pairs = await fetch_pairs(session)
-    log.info(f"📦 {len(pairs)} unika Solana-pairs")
- 
-    now = time.time()
-    fresh = []
-    for p in pairs:
-        addr = (p.get("baseToken") or {}).get("address", "")
-        if not addr or addr in notified:
-            continue
-        # Only re-check after 20 min
-        if now - last_checked.get(addr, 0) < 1200:
-            continue
-        
-        age = age_min(p.get("pairCreatedAt"))
-        liq = (p.get("liquidity") or {}).get("usd", 0) or 0
-        vol = (p.get("volume") or {}).get("h1", 0) or 0
-        
-        # Basic pre-filter
-        if age < MIN_AGE_MIN or age > MAX_AGE_H * 60:
-            continue
-        if liq < MIN_LIQ:
-            continue
-            
-        fresh.append(p)
-        last_checked[addr] = now
- 
-    log.info(f"⏱ {len(fresh)} coins inom filter (ålder+liq)")
-    
-    if not fresh:
-        log.info("ℹ Inga nya coins att kolla — samma coins returneras av API")
+
+async def get_pair_for_token(session, addr):
+    try:
+        async with session.get(
+            f"https://api.dexscreener.com/latest/dex/tokens/{addr}",
+            timeout=aiohttp.ClientTimeout(total=10)
+        ) as r:
+            if r.status != 200: return None
+            d = await r.json(content_type=None)
+            pairs = [p for p in (d.get("pairs") or []) if p.get("chainId") == "solana"]
+            if not pairs: return None
+            return max(pairs, key=lambda p: (p.get("liquidity") or {}).get("usd", 0) or 0)
+    except:
+        return None
+
+async def analyze_and_notify(session, pair):
+    addr   = (pair.get("baseToken") or {}).get("address", "")
+    if not addr or addr in notified: return
+    name   = (pair.get("baseToken") or {}).get("name", "?")
+    ticker = (pair.get("baseToken") or {}).get("symbol", "?")
+    liq    = (pair.get("liquidity") or {}).get("usd", 0) or 0
+    vol1h  = (pair.get("volume") or {}).get("h1", 0) or 0
+    vol24h = (pair.get("volume") or {}).get("h24", 0) or 0
+    buys   = (pair.get("txns") or {}).get("h1", {}).get("buys", 0) or 0
+    sells  = (pair.get("txns") or {}).get("h1", {}).get("sells", 1) or 1
+    mcap   = pair.get("fdv") or pair.get("marketCap") or 0
+    age    = age_min(pair.get("pairCreatedAt"))
+    pct5m  = (pair.get("priceChange") or {}).get("m5", 0) or 0
+    pct1h  = (pair.get("priceChange") or {}).get("h1", 0) or 0
+    pct24h = (pair.get("priceChange") or {}).get("h24", 0) or 0
+    ratio  = buys / max(sells, 1)
+
+    if age < MIN_AGE_MIN or age > MAX_AGE_H * 60: return
+    if liq < MIN_LIQ or vol1h < MIN_VOL_1H: return
+
+    log.info(f"🛡 RugCheck: {name} age={age:.0f}min liq={fmt(liq)} vol={fmt(vol1h)}")
+    rc = await get_rugcheck(session, addr)
+    await asyncio.sleep(0.5)
+
+    score = rc["score"] if rc else 0
+    lp    = rc["lp"] if rc else 0
+    creator_sold = rc["creator_sold"] if rc else False
+
+    log.info(f"  → score={score} lp={lp}% ratio={ratio:.1f}x")
+
+    if score >= MIN_SCORE and lp >= MIN_LP_LOCKED and ratio >= BUY_SELL_RATIO:
+        verdict = "🔥 GO" if score >= 70 else "✅ GO"
+    elif score >= MIN_SCORE and ratio >= BUY_SELL_RATIO:
+        verdict = "⚠️ WARN"
+    else:
+        log.info(f"  → NOGO (score:{score} lp:{lp}% ratio:{ratio:.1f}x)")
         return
- 
-    # Sort by volume desc, take top 8
-    fresh.sort(key=lambda p: (p.get("volume") or {}).get("h1", 0) or 0, reverse=True)
-    to_check = fresh[:8]
- 
-    go_count = 0
-    for i, p in enumerate(to_check):
-        addr = (p.get("baseToken") or {}).get("address", "")
-        name = (p.get("baseToken") or {}).get("name", "?")
-        ticker = (p.get("baseToken") or {}).get("symbol", "?")
-        liq = (p.get("liquidity") or {}).get("usd", 0) or 0
-        vol1h = (p.get("volume") or {}).get("h1", 0) or 0
-        vol24h = (p.get("volume") or {}).get("h24", 0) or 0
-        buys = (p.get("txns") or {}).get("h1", {}).get("buys", 0) or 0
-        sells = (p.get("txns") or {}).get("h1", {}).get("sells", 1) or 1
-        mcap = p.get("fdv") or p.get("marketCap") or 0
-        age = age_min(p.get("pairCreatedAt"))
-        pct1h = (p.get("priceChange") or {}).get("h1", 0) or 0
-        pct24h = (p.get("priceChange") or {}).get("h24", 0) or 0
-        ratio = buys / max(sells, 1)
- 
-        log.info(f"🛡 [{i+1}/{len(to_check)}] RugCheck: {name} (liq={fmt(liq)} vol={fmt(vol1h)} age={age:.0f}min)")
-        rc = await get_rugcheck(session, addr)
-        await asyncio.sleep(0.5)
- 
-        score = rc["score"] if rc else 0
-        lp = rc["lp"] if rc else 0
-        creator_sold = rc["creator_sold"] if rc else False
- 
-        log.info(f"  → score={score} lp={lp}% ratio={ratio:.1f}x age={age:.0f}min")
- 
-        # Verdict
-        if score >= MIN_SCORE and lp >= MIN_LP_LOCKED and ratio >= BUY_SELL_RATIO and vol1h >= MIN_VOL_1H:
-            verdict = "🔥 GO" if score >= 70 else "✅ GO"
-        elif score >= MIN_SCORE and ratio >= BUY_SELL_RATIO:
-            verdict = "⚠️ WARN"
-        else:
-            log.info(f"  → NOGO (score:{score}<{MIN_SCORE} OR lp:{lp}<{MIN_LP_LOCKED} OR ratio:{ratio:.1f}<{BUY_SELL_RATIO})")
-            continue
- 
-        # Send notification
-        notified.add(addr)
-        go_count += 1
-        trend = "+" if pct1h >= 0 else ""
- 
-        passes = []
-        fails = []
-        if score >= MIN_SCORE: passes.append(f"✓ Score {score}/100")
-        else: fails.append(f"✗ Score {score}/100")
-        if lp >= MIN_LP_LOCKED: passes.append(f"✓ LP {lp}%")
-        else: fails.append(f"✗ LP {lp}%")
-        if ratio >= BUY_SELL_RATIO: passes.append(f"✓ Köp/sälj {ratio:.1f}x")
-        else: fails.append(f"✗ Ratio {ratio:.1f}x")
-        if creator_sold: passes.append("✓ Creator SOLD")
-        else: fails.append("⚠ Creator håller")
- 
-        msg = (
-            f"{verdict}: *{name}* (${ticker})\n"
-            f"⏱ {age:.0f} min gammal\n\n"
-            f"💰 MCap: {fmt(mcap)}\n"
-            f"💧 Liq: {fmt(liq)}\n"
-            f"📈 Vol 1h: {fmt(vol1h)} | 24h: {fmt(vol24h)}\n"
-            f"📊 Pris: {trend}{pct1h:.1f}% (1h) | {pct24h:.1f}% (24h)\n"
-            f"🔄 Buys/Sells 1h: {buys}/{sells}\n"
-            f"🛡 Score: {score}/100 | LP: {lp}%\n\n"
-            + ("\n".join(passes + fails)) +
-            f"\n\n🔗 [Dexscreener](https://dexscreener.com/solana/{addr})\n"
-            f"🔍 [RugCheck](https://rugcheck.xyz/tokens/{addr})\n"
-            f"🟣 [Pump.fun](https://pump.fun/{addr})\n\n"
-            f"⚡ _PumpScan Bot_"
-        )
-        await send_tg(session, msg)
-        log.info(f"  → {verdict} notis skickad för {name}!")
- 
-    log.info(f"✅ Scan klar — {go_count} GO/WARN av {len(to_check)} kollade")
- 
+
+    momentum_verdict, momentum_signals = momentum_signal(pct5m, pct1h, buys, sells, vol1h)
+
+    checks = []
+    if score >= MIN_SCORE: checks.append(f"✓ Score {score}/100")
+    else: checks.append(f"✗ Score {score}/100")
+    if lp >= MIN_LP_LOCKED: checks.append(f"✓ LP {lp}%")
+    else: checks.append(f"✗ LP {lp}%")
+    if ratio >= BUY_SELL_RATIO: checks.append(f"✓ Köp/sälj {ratio:.1f}x")
+    else: checks.append(f"✗ Ratio {ratio:.1f}x")
+    if creator_sold: checks.append("✓ Creator SOLD")
+    else: checks.append("⚠ Creator håller")
+
+    msg = (
+        f"{verdict}: *{name}* (${ticker})\n"
+        f"⏱ {age:.0f} min gammal\n\n"
+        f"💰 MCap: {fmt(mcap)}\n"
+        f"💧 Liq: {fmt(liq)}\n"
+        f"📈 Vol 1h: {fmt(vol1h)} | 24h: {fmt(vol24h)}\n"
+        f"📊 Pris 1h: {'+' if pct1h>=0 else ''}{pct1h:.1f}% | 5min: {'+' if pct5m>=0 else ''}{pct5m:.1f}%\n"
+        f"🔄 Buys/Sells: {buys}/{sells}\n"
+        f"🛡 Score: {score}/100 | LP: {lp}%\n\n"
+        f"📊 *CHARTANALYS:*\n"
+        f"{momentum_verdict}\n"
+        + "\n".join(momentum_signals) +
+        f"\n\n🔐 *SÄKERHETSCHECK:*\n"
+        + "\n".join(checks) +
+        f"\n\n🎯 Entry: Nu om momentum håller\n"
+        f"🛑 Stop loss: −20%\n"
+        f"💰 Target: +50–100%\n\n"
+        f"🔗 [Dexscreener](https://dexscreener.com/solana/{addr})\n"
+        f"🔍 [RugCheck](https://rugcheck.xyz/tokens/{addr})\n"
+        f"🟣 [Pump.fun](https://pump.fun/{addr})\n\n"
+        f"⚡ _PumpScan Bot v3_"
+    )
+
+    notified.add(addr)
+    await send_tg(session, msg)
+    log.info(f"  → {verdict} skickad för {name}!")
+
+async def helius_new_tokens(session):
+    """Use Helius to get newly created tokens via enhanced API."""
+    url = f"https://api.helius.xyz/v0/addresses/TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA/transactions?api-key={HELIUS_KEY}&type=CREATE_ACCOUNT&limit=20"
+    while True:
+        try:
+            log.info("⚡ Helius — hämtar nya tokens...")
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=15)) as r:
+                if r.status == 200:
+                    txns = await r.json(content_type=None)
+                    log.info(f"  → {len(txns)} transaktioner från Helius")
+                    for txn in txns:
+                        for acc in txn.get("accountData", []):
+                            addr = acc.get("account", "")
+                            if addr and addr not in notified and addr not in last_check:
+                                last_check[addr] = time.time()
+                                await asyncio.sleep(20)  # wait for liquidity
+                                pair = await get_pair_for_token(session, addr)
+                                if pair:
+                                    await analyze_and_notify(session, pair)
+                else:
+                    log.warning(f"Helius HTTP {r.status}")
+        except Exception as e:
+            log.warning(f"Helius fel: {e}")
+        await asyncio.sleep(30)
+
+async def dex_scan_loop(session):
+    """Backup Dexscreener scan every 45s."""
+    while True:
+        try:
+            log.info("🔍 Dexscreener scan...")
+            searches = [
+                "https://api.dexscreener.com/latest/dex/search?q=pump.fun",
+                "https://api.dexscreener.com/latest/dex/search?q=pumpswap",
+                "https://api.dexscreener.com/token-boosts/latest/v1",
+                "https://api.dexscreener.com/token-profiles/latest/v1",
+            ]
+            all_pairs = []
+            for url in searches:
+                try:
+                    async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as r:
+                        if r.status != 200: continue
+                        d = await r.json(content_type=None)
+                        if isinstance(d, list):
+                            for item in d:
+                                chain = item.get("chainId") or item.get("chain", "")
+                                if chain == "solana":
+                                    addr = item.get("tokenAddress") or item.get("address", "")
+                                    if addr and addr not in notified and addr not in last_check:
+                                        try:
+                                            async with session.get(f"https://api.dexscreener.com/latest/dex/tokens/{addr}", timeout=aiohttp.ClientTimeout(total=8)) as r2:
+                                                if r2.status == 200:
+                                                    d2 = await r2.json(content_type=None)
+                                                    pairs = [p for p in (d2.get("pairs") or []) if p.get("chainId") == "solana"]
+                                                    if pairs:
+                                                        all_pairs.append(max(pairs, key=lambda p: (p.get("liquidity") or {}).get("usd", 0) or 0))
+                                        except: pass
+                        else:
+                            for p in (d.get("pairs") or []):
+                                if p.get("chainId") == "solana":
+                                    all_pairs.append(p)
+                except Exception as e:
+                    log.warning(f"Dex error: {e}")
+                await asyncio.sleep(0.3)
+
+            seen = set()
+            now = time.time()
+            fresh = []
+            for p in all_pairs:
+                addr = (p.get("baseToken") or {}).get("address", "")
+                if not addr or addr in seen or addr in notified: continue
+                if now - last_check.get(addr, 0) < 1200: continue
+                seen.add(addr)
+                age = age_min(p.get("pairCreatedAt"))
+                liq = (p.get("liquidity") or {}).get("usd", 0) or 0
+                if MIN_AGE_MIN <= age <= MAX_AGE_H * 60 and liq >= MIN_LIQ:
+                    fresh.append(p)
+                    last_check[addr] = now
+
+            log.info(f"📦 {len(fresh)} nya coins att analysera")
+            fresh.sort(key=lambda p: (p.get("volume") or {}).get("h1", 0) or 0, reverse=True)
+            for p in fresh[:6]:
+                await analyze_and_notify(session, p)
+                await asyncio.sleep(1)
+
+        except Exception as e:
+            log.error(f"Dex scan fel: {e}")
+        await asyncio.sleep(SCAN_EVERY)
+
 async def main():
-    log.info("🚀 PumpScan Bot v2 startar...")
-    conn = aiohttp.TCPConnector(limit=5, ssl=False)
+    log.info("🚀 PumpScan Bot v3 startar...")
+    conn = aiohttp.TCPConnector(limit=10, ssl=False)
     async with aiohttp.ClientSession(connector=conn) as session:
         await send_tg(session,
-            "🤖 *PumpScan Bot v2 startad!*\n\n"
-            f"🔍 Scannar var {SCAN_EVERY}s\n"
+            "🤖 *PumpScan Bot v3 startad!*\n\n"
+            "⚡ Helius API — nya tokens snabbt\n"
+            "📊 Automatisk chartanalys\n"
+            "🔍 Dexscreener backup var 45s\n\n"
             f"💧 Min liq: {fmt(MIN_LIQ)}\n"
             f"🛡 Min score: {MIN_SCORE}\n"
-            f"🔒 Min LP: {MIN_LP_LOCKED}%\n"
-            f"⏱ Ålder: {MIN_AGE_MIN}min–{MAX_AGE_H}h\n"
-            f"🟢 Ratio: {BUY_SELL_RATIO}x+\n\n"
-            "⚡ _PumpScan Bot_"
+            f"⏱ Ålder: {MIN_AGE_MIN}min–{MAX_AGE_H}h\n\n"
+            "⚡ _PumpScan Bot v3_"
         )
-        while True:
-            try:
-                await scan(session)
-            except Exception as e:
-                log.error(f"Scan fel: {e}")
-            log.info(f"⏳ Väntar {SCAN_EVERY}s...")
-            await asyncio.sleep(SCAN_EVERY)
- 
+        await asyncio.gather(
+            helius_new_tokens(session),
+            dex_scan_loop(session),
+        )
+
 if __name__ == "__main__":
     asyncio.run(main())
- 
