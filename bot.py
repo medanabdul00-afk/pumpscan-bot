@@ -5,7 +5,6 @@ import os
 import time
 import json
 import base58
-import nacl.signing
 import base64
 from solders.keypair import Keypair
 from solders.transaction import VersionedTransaction
@@ -15,22 +14,29 @@ TG_TOKEN      = os.getenv("TG_TOKEN", "8908814441:AAGFGs52sINf_LjU6Mt6YP_yCcEZvQ
 TG_CHAT       = os.getenv("TG_CHAT",  "5667140911")
 HELIUS_KEY    = os.getenv("HELIUS_KEY", "85dee6a1-d8e2-421e-8a26-33645c4a943f")
 WALLET_KEY    = os.getenv("WALLET_PRIVATE_KEY", "")
-SCAN_EVERY    = int(os.getenv("SCAN_EVERY", "45"))
+SCAN_EVERY    = int(os.getenv("SCAN_EVERY", "30"))
 
 # Trading config
-BUY_AMOUNT_SOL  = float(os.getenv("BUY_AMOUNT_SOL", "0.05"))
-MAX_TRADES      = int(os.getenv("MAX_TRADES", "3"))
+BUY_AMOUNT_SOL   = float(os.getenv("BUY_AMOUNT_SOL", "0.05"))
+MAX_TRADES       = int(os.getenv("MAX_TRADES", "3"))
 DAILY_LOSS_LIMIT = float(os.getenv("DAILY_LOSS_LIMIT", "0.25"))
-TAKE_PROFIT_1   = float(os.getenv("TAKE_PROFIT_1", "1.0"))
-TAKE_PROFIT_2   = float(os.getenv("TAKE_PROFIT_2", "2.0"))
-STOP_LOSS       = float(os.getenv("STOP_LOSS", "0.20"))
+TRAILING_STOP    = float(os.getenv("TRAILING_STOP", "0.20"))  # 20% trailing stop
+
+# Delutgångar
+TP1_PCT   = 1.0   # +100% sälj 50%
+TP2_PCT   = 3.0   # +300% sälj 25%
+TP3_PCT   = 7.0   # +700% sälj 25% (moonbag kvar)
 
 # Market filters
-MIN_LIQ        = 5_000
-MIN_VOL_1H     = 500
-BUY_SELL_RATIO = 1.5
-MAX_AGE_H      = 2
-MIN_AGE_MIN    = 2
+MIN_LIQ        = 15_000
+MIN_VOL_1H     = 5_000
+MIN_BUYS_1H    = 50       # minst 50 köp senaste timmen
+BUY_SELL_RATIO = 2.0
+MAX_AGE_MIN    = 60
+MIN_AGE_MIN    = 5
+MIN_PCT5M      = 3.0
+MIN_MCAP       = 20_000   # min $20K mcap
+MAX_MCAP       = 500_000  # max $500K mcap
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s", datefmt="%H:%M:%S")
 log = logging.getLogger("pumpscan")
@@ -38,7 +44,7 @@ log = logging.getLogger("pumpscan")
 # State
 notified      = set()
 last_check    = {}
-active_trades = {}
+active_trades = {}  # addr -> {buy_price, amount_sol, buy_time, tp1_done, tp2_done, tp3_done, peak_price, symbol, tx}
 daily_loss    = 0.0
 RECHECK_AFTER = 600
 
@@ -103,13 +109,12 @@ async def get_sol_price(session):
     except:
         return 180.0
 
-async def send_transaction(session, tx_base64: str) -> str | None:
+async def send_transaction(session, tx_base64: str):
     try:
         signed_tx = sign_and_encode(tx_base64)
     except Exception as e:
         log.error(f"Signering fel: {e}")
         return None
-
     try:
         async with session.post(
             f"https://mainnet.helius-rpc.com/?api-key={HELIUS_KEY}",
@@ -117,15 +122,12 @@ async def send_transaction(session, tx_base64: str) -> str | None:
                 "jsonrpc": "2.0",
                 "id": 1,
                 "method": "sendTransaction",
-                "params": [
-                    signed_tx,
-                    {
-                        "encoding": "base64",
-                        "skipPreflight": False,
-                        "preflightCommitment": "confirmed",
-                        "maxRetries": 3
-                    }
-                ]
+                "params": [signed_tx, {
+                    "encoding": "base64",
+                    "skipPreflight": False,
+                    "preflightCommitment": "confirmed",
+                    "maxRetries": 3
+                }]
             },
             timeout=aiohttp.ClientTimeout(total=30)
         ) as r:
@@ -144,17 +146,14 @@ async def buy_token(session, token_addr, token_symbol):
     if not WALLET_KEY:
         log.warning("Ingen wallet key!")
         return None
-
     if len(active_trades) >= MAX_TRADES:
-        log.info(f"Max trades ({MAX_TRADES}) nådda — skippar köp")
+        log.info(f"Max trades ({MAX_TRADES}) nådda")
         return None
-
     if daily_loss >= DAILY_LOSS_LIMIT:
-        log.warning(f"Daglig förlustgräns nådd ({daily_loss:.3f} SOL)")
         await send_tg(session,
             f"🛑 *Daglig förlustgräns nådd!*\n"
             f"Förlorat {daily_loss:.3f} SOL idag.\n"
-            f"Boten pausar trading tills imorgon. 🔒"
+            f"Boten pausar tills imorgon. 🔒"
         )
         return None
 
@@ -167,10 +166,8 @@ async def buy_token(session, token_addr, token_symbol):
 
         async with session.get(
             f"https://lite-api.jup.ag/swap/v1/quote"
-            f"?inputMint={WSOL}"
-            f"&outputMint={token_addr}"
-            f"&amount={buy_lamports}"
-            f"&slippageBps=2000",
+            f"?inputMint={WSOL}&outputMint={token_addr}"
+            f"&amount={buy_lamports}&slippageBps=2000",
             timeout=aiohttp.ClientTimeout(total=10)
         ) as r:
             if r.status != 200:
@@ -179,30 +176,24 @@ async def buy_token(session, token_addr, token_symbol):
             quote = await r.json(content_type=None)
 
         if not quote or "outAmount" not in quote:
-            log.warning("Ingen quote från Jupiter")
             return None
-
-        log.info(f"  → Får {quote['outAmount']} tokens för {BUY_AMOUNT_SOL} SOL")
-
-        swap_body = {
-            "quoteResponse": quote,
-            "userPublicKey": get_public_key_str(),
-            "wrapAndUnwrapSol": True,
-            "computeUnitPriceMicroLamports": 50000,
-        }
 
         async with session.post(
             "https://lite-api.jup.ag/swap/v1/swap",
-            json=swap_body,
+            json={
+                "quoteResponse": quote,
+                "userPublicKey": get_public_key_str(),
+                "wrapAndUnwrapSol": True,
+                "computeUnitPriceMicroLamports": 50000,
+            },
             timeout=aiohttp.ClientTimeout(total=15)
         ) as r:
             if r.status != 200:
-                log.warning(f"Jupiter swap fel: {r.status} — {await r.text()}")
+                log.warning(f"Jupiter swap fel: {r.status}")
                 return None
             swap_data = await r.json(content_type=None)
 
         if not swap_data.get("swapTransaction"):
-            log.warning("Ingen swap transaction från Jupiter")
             return None
 
         tx_sig = await send_transaction(session, swap_data["swapTransaction"])
@@ -214,23 +205,22 @@ async def buy_token(session, token_addr, token_symbol):
         buy_price = await get_token_price(session, token_addr)
         active_trades[token_addr] = {
             "buy_price": buy_price,
-            "buy_price_usd": buy_price * sol_price if buy_price else 0,
+            "peak_price": buy_price,
             "amount_sol": BUY_AMOUNT_SOL,
             "buy_time": time.time(),
             "tp1_done": False,
+            "tp2_done": False,
+            "tp3_done": False,
             "symbol": token_symbol,
             "tx": tx_sig,
         }
-
         return tx_sig
 
     except Exception as e:
-        log.error(f"Kjøp-fel: {e}")
+        log.error(f"Köp-fel: {e}")
         return None
 
 async def sell_token(session, token_addr, reason="manual", pct=100):
-    global daily_loss
-
     if token_addr not in active_trades:
         return None
 
@@ -238,10 +228,8 @@ async def sell_token(session, token_addr, reason="manual", pct=100):
 
     try:
         WSOL = "So11111111111111111111111111111111111111112"
-
         balance = await get_token_balance(session, token_addr)
         if not balance or balance == 0:
-            log.warning(f"Ingen balance för {token_addr[:12]}")
             active_trades.pop(token_addr, None)
             return None
 
@@ -249,42 +237,33 @@ async def sell_token(session, token_addr, reason="manual", pct=100):
         if sell_amount == 0:
             return None
 
-        log.info(f"💸 Säljer {pct}% av {trade['symbol']} — anledning: {reason}")
+        log.info(f"💸 Säljer {pct}% av {trade['symbol']} — {reason}")
 
         async with session.get(
             f"https://lite-api.jup.ag/swap/v1/quote"
-            f"?inputMint={token_addr}"
-            f"&outputMint={WSOL}"
-            f"&amount={sell_amount}"
-            f"&slippageBps=2500",
+            f"?inputMint={token_addr}&outputMint={WSOL}"
+            f"&amount={sell_amount}&slippageBps=2500",
             timeout=aiohttp.ClientTimeout(total=10)
         ) as r:
-            if r.status != 200:
-                log.warning(f"Sell quote fel: {r.status}")
-                return None
+            if r.status != 200: return None
             quote = await r.json(content_type=None)
 
-        if not quote:
-            return None
-
-        swap_body = {
-            "quoteResponse": quote,
-            "userPublicKey": get_public_key_str(),
-            "wrapAndUnwrapSol": True,
-            "computeUnitPriceMicroLamports": 50000,
-        }
+        if not quote: return None
 
         async with session.post(
             "https://lite-api.jup.ag/swap/v1/swap",
-            json=swap_body,
+            json={
+                "quoteResponse": quote,
+                "userPublicKey": get_public_key_str(),
+                "wrapAndUnwrapSol": True,
+                "computeUnitPriceMicroLamports": 50000,
+            },
             timeout=aiohttp.ClientTimeout(total=15)
         ) as r:
-            if r.status != 200:
-                return None
+            if r.status != 200: return None
             swap_data = await r.json(content_type=None)
 
-        if not swap_data.get("swapTransaction"):
-            return None
+        if not swap_data.get("swapTransaction"): return None
 
         tx_sig = await send_transaction(session, swap_data["swapTransaction"])
 
@@ -318,26 +297,21 @@ async def get_token_balance(session, token_addr):
         async with session.post(
             f"https://mainnet.helius-rpc.com/?api-key={HELIUS_KEY}",
             json={
-                "jsonrpc": "2.0",
-                "id": 1,
+                "jsonrpc": "2.0", "id": 1,
                 "method": "getTokenAccountsByOwner",
-                "params": [
-                    pub_key,
-                    {"mint": token_addr},
-                    {"encoding": "jsonParsed"}
-                ]
+                "params": [pub_key, {"mint": token_addr}, {"encoding": "jsonParsed"}]
             },
             timeout=aiohttp.ClientTimeout(total=10)
         ) as r:
             result = await r.json(content_type=None)
             accounts = result.get("result", {}).get("value", [])
             if not accounts: return 0
-            amount = accounts[0]["account"]["data"]["parsed"]["info"]["tokenAmount"]["amount"]
-            return int(amount)
+            return int(accounts[0]["account"]["data"]["parsed"]["info"]["tokenAmount"]["amount"])
     except:
         return 0
 
 async def monitor_trades(session):
+    """Trailing stop + delutgångar."""
     while True:
         try:
             for addr in list(active_trades.keys()):
@@ -348,16 +322,37 @@ async def monitor_trades(session):
                 if not current_price or not trade["buy_price"]:
                     continue
 
+                # Uppdatera peak price
+                if current_price > (trade["peak_price"] or 0):
+                    trade["peak_price"] = current_price
+
                 pct_change = (current_price - trade["buy_price"]) / trade["buy_price"]
+                pct_from_peak = (current_price - trade["peak_price"]) / trade["peak_price"] if trade["peak_price"] else 0
                 symbol = trade["symbol"]
 
-                log.info(f"📊 {symbol}: {pct_change*100:.1f}%")
+                log.info(f"📊 {symbol}: {pct_change*100:+.1f}% (peak: {((trade['peak_price']/trade['buy_price'])-1)*100:+.1f}%)")
 
-                if pct_change <= -STOP_LOSS:
-                    log.info(f"🛑 Stop loss triggered for {symbol}!")
-                    await sell_token(session, addr, reason="stop_loss", pct=100)
-                    loss_sol = trade["amount_sol"] * STOP_LOSS
+                # Trailing stop — sälj allt om -20% från toppen
+                if pct_from_peak <= -TRAILING_STOP and pct_change > -0.15:
+                    log.info(f"📉 Trailing stop {symbol} — {pct_from_peak*100:.1f}% från toppen")
+                    await sell_token(session, addr, reason="trailing_stop", pct=100)
+                    profit_loss = trade["amount_sol"] * pct_change
                     global daily_loss
+                    if profit_loss < 0:
+                        daily_loss += abs(profit_loss)
+                    await send_tg(session,
+                        f"📉 *TRAILING STOP — {symbol}*\n"
+                        f"Sålde vid {pct_change*100:+.1f}% från köp\n"
+                        f"Föll {pct_from_peak*100:.1f}% från toppen\n"
+                        f"{'Vinst' if profit_loss > 0 else 'Förlust'}: {abs(profit_loss):.3f} SOL\n\n"
+                        f"⚡ _PumpScan Bot_"
+                    )
+
+                # Hårt stop loss vid -20% (om ingen pump skett)
+                elif pct_change <= -0.20 and not trade["tp1_done"]:
+                    log.info(f"🛑 Stop loss {symbol}")
+                    await sell_token(session, addr, reason="stop_loss", pct=100)
+                    loss_sol = trade["amount_sol"] * 0.20
                     daily_loss += loss_sol
                     await send_tg(session,
                         f"🛑 *STOP LOSS — {symbol}*\n"
@@ -367,34 +362,46 @@ async def monitor_trades(session):
                         f"⚡ _PumpScan Bot_"
                     )
 
-                elif pct_change >= TAKE_PROFIT_1 and not trade["tp1_done"]:
-                    log.info(f"🎯 Take profit 1 triggered for {symbol}!")
-                    await sell_token(session, addr, reason="take_profit_1", pct=50)
+                # TP1 — sälj 50% vid +100%
+                elif pct_change >= TP1_PCT and not trade["tp1_done"]:
+                    await sell_token(session, addr, reason="tp1", pct=50)
                     trade["tp1_done"] = True
-                    profit_sol = trade["amount_sol"] * 0.5 * TAKE_PROFIT_1
+                    profit = trade["amount_sol"] * 0.5 * TP1_PCT
                     await send_tg(session,
-                        f"🎯 *TAKE PROFIT 50% — {symbol}*\n"
-                        f"Sålde 50% vid +{pct_change*100:.0f}%\n"
-                        f"Vinst: ca +{profit_sol:.3f} SOL 💰\n"
-                        f"Håller 50% — target +200%\n\n"
+                        f"🎯 *TP1 +100% — {symbol}*\n"
+                        f"Sålde 50% — vinst: +{profit:.3f} SOL 💰\n"
+                        f"Håller 50% med trailing stop\n\n"
                         f"⚡ _PumpScan Bot_"
                     )
 
-                elif pct_change >= TAKE_PROFIT_2 and trade["tp1_done"]:
-                    log.info(f"🚀 Take profit 2 triggered for {symbol}!")
-                    await sell_token(session, addr, reason="take_profit_2", pct=100)
-                    profit_sol = trade["amount_sol"] * TAKE_PROFIT_2
+                # TP2 — sälj 25% vid +300%
+                elif pct_change >= TP2_PCT and trade["tp1_done"] and not trade["tp2_done"]:
+                    await sell_token(session, addr, reason="tp2", pct=50)
+                    trade["tp2_done"] = True
+                    profit = trade["amount_sol"] * 0.25 * TP2_PCT
                     await send_tg(session,
-                        f"🚀 *TAKE PROFIT 100% — {symbol}*\n"
-                        f"Sålde resten vid +{pct_change*100:.0f}%\n"
-                        f"Total vinst: ca +{profit_sol:.3f} SOL 💰🔥\n\n"
+                        f"🚀 *TP2 +300% — {symbol}*\n"
+                        f"Sålde 25% — vinst: +{profit:.3f} SOL 💰🔥\n"
+                        f"Håller 25% som moonbag\n\n"
+                        f"⚡ _PumpScan Bot_"
+                    )
+
+                # TP3 — sälj 25% vid +700%
+                elif pct_change >= TP3_PCT and trade["tp2_done"] and not trade["tp3_done"]:
+                    await sell_token(session, addr, reason="tp3", pct=50)
+                    trade["tp3_done"] = True
+                    profit = trade["amount_sol"] * 0.25 * TP3_PCT
+                    await send_tg(session,
+                        f"🌙 *TP3 +700% — {symbol}*\n"
+                        f"Sålde 25% — vinst: +{profit:.3f} SOL 🌙💰\n"
+                        f"Håller moonbag\n\n"
                         f"⚡ _PumpScan Bot_"
                     )
 
                 await asyncio.sleep(2)
 
         except Exception as e:
-            log.error(f"Monitor trades fel: {e}")
+            log.error(f"Monitor fel: {e}")
 
         await asyncio.sleep(30)
 
@@ -408,20 +415,29 @@ async def full_rugcheck(session, addr):
             d = await r.json(content_type=None)
 
         freeze_auth = d.get("freezeAuthority") or d.get("freeze_authority")
-        has_freeze = freeze_auth is not None and freeze_auth != "" and freeze_auth != "null"
+        has_freeze = freeze_auth not in [None, "", "null"]
         mint_auth = d.get("mintAuthority") or d.get("mint_authority")
-        has_mint = mint_auth is not None and mint_auth != "" and mint_auth != "null"
+        has_mint = mint_auth not in [None, "", "null"]
         mutable = d.get("mutableMetadata") or False
         top_holders = d.get("topHolders") or []
+
         max_holder_pct = 0
-        if top_holders:
-            non_lp = [h for h in top_holders if not h.get("isLpHolder")]
-            if non_lp:
-                max_holder_pct = max(h.get("pct", 0) for h in non_lp)
+        top10_pct = 0
+        non_lp = [h for h in top_holders if not h.get("isLpHolder")]
+        if non_lp:
+            max_holder_pct = max(h.get("pct", 0) for h in non_lp)
+            top10_pct = sum(h.get("pct", 0) for h in non_lp[:10])
+
         markets = d.get("markets") or []
+        lp_locked = False
+        if markets:
+            lp_pct = float(markets[0].get("lpLockedPct") or 0)
+            lp_locked = lp_pct >= 80  # minst 80% LP låst
+
         score = 0
         if isinstance(d.get("score"), (int, float)):
             score = min(100, max(0, round(d["score"])))
+
         risks = d.get("risks") or []
         risk_names = [r.get("name", "").lower() for r in risks]
         is_honeypot = any("honeypot" in r for r in risk_names)
@@ -431,11 +447,12 @@ async def full_rugcheck(session, addr):
 
         return {
             "score": score,
-            "creator_sold": d.get("creatorBalance") == "SOLD",
             "freeze_authority": has_freeze or has_freeze_risk,
             "mint_authority": has_mint or has_mint_risk,
             "mutable_metadata": mutable,
             "max_holder_pct": max_holder_pct,
+            "top10_pct": top10_pct,
+            "lp_locked": lp_locked,
             "is_honeypot": is_honeypot,
             "high_risks": high_risks,
         }
@@ -448,9 +465,11 @@ def is_safe(rc):
     if rc["mint_authority"]: return False
     if rc["is_honeypot"]: return False
     if rc["mutable_metadata"]: return False
-    if rc["max_holder_pct"] > 30: return False
+    if rc["max_holder_pct"] > 10: return False   # dev wallet max 10%
+    if rc["top10_pct"] > 50: return False         # top 10 max 50%
+    if not rc["lp_locked"]: return False          # LP måste vara låst
     if len(rc["high_risks"]) > 0: return False
-    if rc["score"] < 30: return False
+    if rc["score"] < 50: return False
     return True
 
 async def analyze_and_buy(session, pair):
@@ -463,26 +482,32 @@ async def analyze_and_buy(session, pair):
     vol1h  = (pair.get("volume") or {}).get("h1", 0) or 0
     buys   = (pair.get("txns") or {}).get("h1", {}).get("buys", 0) or 0
     sells  = (pair.get("txns") or {}).get("h1", {}).get("sells", 1) or 1
+    mcap   = pair.get("fdv") or pair.get("marketCap") or 0
     age    = age_min(pair.get("pairCreatedAt"))
     pct5m  = (pair.get("priceChange") or {}).get("m5", 0) or 0
     pct1h  = (pair.get("priceChange") or {}).get("h1", 0) or 0
     ratio  = buys / max(sells, 1)
+    dex    = pair.get("dexId", "")
 
-    if age < MIN_AGE_MIN or age > MAX_AGE_H * 60: return
+    if "raydium" not in dex.lower(): return
+    if age < MIN_AGE_MIN or age > MAX_AGE_MIN: return
     if liq < MIN_LIQ or vol1h < MIN_VOL_1H: return
+    if buys < MIN_BUYS_1H: return
     if ratio < BUY_SELL_RATIO: return
+    if pct5m < MIN_PCT5M: return
+    if mcap < MIN_MCAP or mcap > MAX_MCAP: return
 
-    log.info(f"🔍 Analyserar: {name} age={age:.0f}min liq={fmt(liq)} ratio={ratio:.1f}x")
+    log.info(f"🔍 {name} age={age:.0f}min liq={fmt(liq)} vol={fmt(vol1h)} buys={buys} mcap={fmt(mcap)} +{pct5m:.1f}%")
 
     rc = await full_rugcheck(session, addr)
     await asyncio.sleep(0.5)
 
     if not rc:
-        log.info(f"  → Ingen RugCheck data — skippar")
+        log.info(f"  → Ingen RugCheck — skippar")
         return
 
     if not is_safe(rc):
-        log.info(f"  → NOGO säkerhet — freeze:{rc['freeze_authority']} mint:{rc['mint_authority']} honeypot:{rc['is_honeypot']}")
+        log.info(f"  → NOGO — dev:{rc['max_holder_pct']:.0f}% top10:{rc['top10_pct']:.0f}% lp_locked:{rc['lp_locked']} score:{rc['score']}")
         return
 
     notified.add(addr)
@@ -492,27 +517,22 @@ async def analyze_and_buy(session, pair):
 
     if tx_sig:
         sol_price = await get_sol_price(session)
-        usd_amount = BUY_AMOUNT_SOL * sol_price
         await send_tg(session,
             f"🔥 *KÖPT: {name}* (${ticker})\n"
-            f"⏱ {age:.0f} min gammal\n\n"
-            f"💰 Investerat: {BUY_AMOUNT_SOL} SOL (${usd_amount:.0f})\n"
-            f"💧 Liq: {fmt(liq)}\n"
-            f"📈 Vol 1h: {fmt(vol1h)}\n"
-            f"📊 +{pct5m:.1f}% (5min) | +{pct1h:.1f}% (1h)\n"
-            f"🔄 Köp/sälj: {buys}/{sells} ({ratio:.1f}x)\n"
-            f"🛡 Score: {rc['score']}/100\n\n"
-            f"🎯 TP1: +100% (säljer 50%)\n"
-            f"🎯 TP2: +200% (säljer resten)\n"
-            f"🛑 Stop loss: -20%\n\n"
-            f"🔗 [Dexscreener](https://dexscreener.com/solana/{addr})\n"
-            f"🔍 [RugCheck](https://rugcheck.xyz/tokens/{addr})\n\n"
+            f"⏱ {age:.0f} min | Raydium\n\n"
+            f"💰 {BUY_AMOUNT_SOL} SOL (${BUY_AMOUNT_SOL*sol_price:.0f})\n"
+            f"💧 Liq: {fmt(liq)} | MCap: {fmt(mcap)}\n"
+            f"📈 Vol 1h: {fmt(vol1h)} | Köp: {buys}\n"
+            f"📊 +{pct5m:.1f}% (5min) | Ratio: {ratio:.1f}x\n"
+            f"🛡 Score: {rc['score']}/100 | LP låst: ✅\n\n"
+            f"🎯 TP1: +100% (50%) → TP2: +300% (25%) → TP3: +700% (25%)\n"
+            f"📉 Trailing stop: -20% från topp\n\n"
+            f"🔗 [Dexscreener](https://dexscreener.com/solana/{addr})\n\n"
             f"⚡ _PumpScan Bot v5_"
         )
     else:
         await send_tg(session,
             f"⚠️ *GO men köp misslyckades: {name}*\n"
-            f"Kolla manuellt!\n"
             f"🔗 [Dexscreener](https://dexscreener.com/solana/{addr})\n\n"
             f"⚡ _PumpScan Bot v5_"
         )
@@ -520,16 +540,16 @@ async def analyze_and_buy(session, pair):
 async def dex_scan_loop(session):
     while True:
         try:
-            log.info("🔍 Dexscreener scan...")
-            searches = [
-                "https://api.dexscreener.com/latest/dex/search?q=pump.fun",
-                "https://api.dexscreener.com/latest/dex/search?q=pumpswap",
-                "https://api.dexscreener.com/latest/dex/search?q=solana+meme",
+            log.info("🔍 Scannar Raydium nylistningar...")
+            all_pairs = []
+
+            urls = [
+                "https://api.dexscreener.com/latest/dex/search?q=raydium",
                 "https://api.dexscreener.com/token-boosts/latest/v1",
                 "https://api.dexscreener.com/token-profiles/latest/v1",
             ]
-            all_pairs = []
-            for url in searches:
+
+            for url in urls:
                 try:
                     async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as r:
                         if r.status != 200: continue
@@ -541,19 +561,27 @@ async def dex_scan_loop(session):
                                     addr = item.get("tokenAddress") or item.get("address", "")
                                     if addr and addr not in notified and addr not in last_check:
                                         try:
-                                            async with session.get(f"https://api.dexscreener.com/latest/dex/tokens/{addr}", timeout=aiohttp.ClientTimeout(total=8)) as r2:
+                                            async with session.get(
+                                                f"https://api.dexscreener.com/latest/dex/tokens/{addr}",
+                                                timeout=aiohttp.ClientTimeout(total=8)
+                                            ) as r2:
                                                 if r2.status == 200:
                                                     d2 = await r2.json(content_type=None)
-                                                    pairs = [p for p in (d2.get("pairs") or []) if p.get("chainId") == "solana"]
-                                                    if pairs:
-                                                        all_pairs.append(max(pairs, key=lambda p: (p.get("liquidity") or {}).get("usd", 0) or 0))
+                                                    token_pairs = [
+                                                        p for p in (d2.get("pairs") or [])
+                                                        if p.get("chainId") == "solana"
+                                                        and "raydium" in p.get("dexId", "").lower()
+                                                    ]
+                                                    if token_pairs:
+                                                        all_pairs.append(max(token_pairs, key=lambda p: (p.get("liquidity") or {}).get("usd", 0) or 0))
                                         except: pass
                         else:
                             for p in (d.get("pairs") or []):
-                                if p.get("chainId") == "solana":
+                                if (p.get("chainId") == "solana" and
+                                        "raydium" in p.get("dexId", "").lower()):
                                     all_pairs.append(p)
                 except Exception as e:
-                    log.warning(f"Dex error: {e}")
+                    log.warning(f"Scan error: {e}")
                 await asyncio.sleep(0.3)
 
             seen = set()
@@ -570,36 +598,35 @@ async def dex_scan_loop(session):
                 seen.add(addr)
                 age = age_min(p.get("pairCreatedAt"))
                 liq = (p.get("liquidity") or {}).get("usd", 0) or 0
-                if MIN_AGE_MIN <= age <= MAX_AGE_H * 60 and liq >= MIN_LIQ:
+                if MIN_AGE_MIN <= age <= MAX_AGE_MIN and liq >= MIN_LIQ:
                     fresh.append(p)
                     last_check[addr] = now
 
-            log.info(f"📦 {len(fresh)} nya coins att analysera")
+            log.info(f"📦 {len(fresh)} nya Raydium coins")
             fresh.sort(key=lambda p: (p.get("volume") or {}).get("h1", 0) or 0, reverse=True)
-            for p in fresh[:6]:
+            for p in fresh[:8]:
                 await analyze_and_buy(session, p)
                 await asyncio.sleep(1)
 
         except Exception as e:
-            log.error(f"Dex scan fel: {e}")
+            log.error(f"Scan fel: {e}")
         await asyncio.sleep(SCAN_EVERY)
 
 async def main():
-    log.info("🚀 PumpScan Bot v5 (Auto-trading) startar...")
+    log.info("🚀 PumpScan Bot v5 — Smart Edition startar...")
     conn = aiohttp.TCPConnector(limit=10, ssl=False)
     async with aiohttp.ClientSession(connector=conn) as session:
         sol_price = await get_sol_price(session)
         await send_tg(session,
-            f"🤖 *PumpScan Bot v5 startad!*\n\n"
-            f"🤖 *AUTO-TRADING AKTIVT*\n"
+            f"🤖 *PumpScan Bot v5 — Smart Edition*\n\n"
+            f"🎯 Raydium | MCap $20K-$500K\n"
             f"💰 Per trade: {BUY_AMOUNT_SOL} SOL (${BUY_AMOUNT_SOL*sol_price:.0f})\n"
-            f"📊 Max trades: {MAX_TRADES} samtidigt\n"
-            f"🛑 Stop loss: -{STOP_LOSS*100:.0f}%\n"
-            f"🎯 TP1: +{TAKE_PROFIT_1*100:.0f}% (säljer 50%)\n"
-            f"🎯 TP2: +{TAKE_PROFIT_2*100:.0f}% (säljer resten)\n"
-            f"🔒 Daglig förlustgräns: {DAILY_LOSS_LIMIT} SOL\n\n"
-            f"🛡 Säkerhetskontroller aktiva\n"
-            f"📱 Du får notis vid varje köp och sälj\n\n"
+            f"📊 Max trades: {MAX_TRADES}\n"
+            f"📉 Trailing stop: -{TRAILING_STOP*100:.0f}% från topp\n"
+            f"🎯 TP1: +100% | TP2: +300% | TP3: +700%\n"
+            f"🔒 LP måste vara låst\n"
+            f"👛 Dev max 10% | Top10 max 50%\n"
+            f"📈 Min 50 köp/timme\n\n"
             f"⚡ _PumpScan Bot v5_"
         )
         await asyncio.gather(
