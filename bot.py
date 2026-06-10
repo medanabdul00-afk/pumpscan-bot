@@ -54,13 +54,15 @@ def age_min(ts):
     return (time.time()*1000 - t) / 60_000
 
 def get_keypair() -> Keypair:
-    """Load Keypair from private key string (base58 or JSON array)."""
     raw = WALLET_KEY.strip()
     if raw.startswith("["):
         key_bytes = bytes(json.loads(raw))
     else:
         key_bytes = base58.b58decode(raw)
-    return Keypair.from_bytes(key_bytes[:64])
+    if len(key_bytes) == 32:
+        return Keypair.from_seed(key_bytes)
+    else:
+        return Keypair.from_bytes(key_bytes)
 
 def get_public_key_str() -> str:
     try:
@@ -70,7 +72,6 @@ def get_public_key_str() -> str:
         return ""
 
 def sign_and_encode(tx_base64: str) -> str:
-    """Sign a base64-encoded versioned transaction and return signed base64."""
     keypair = get_keypair()
     raw_tx = base64.b64decode(tx_base64)
     tx = VersionedTransaction.from_bytes(raw_tx)
@@ -103,7 +104,6 @@ async def get_sol_price(session):
         return 180.0
 
 async def send_transaction(session, tx_base64: str) -> str | None:
-    """Sign and send a transaction via Helius."""
     try:
         signed_tx = sign_and_encode(tx_base64)
     except Exception as e:
@@ -133,8 +133,7 @@ async def send_transaction(session, tx_base64: str) -> str | None:
             if result.get("error"):
                 log.warning(f"Send TX fel: {result['error']}")
                 return None
-            tx_sig = result.get("result")
-            return tx_sig
+            return result.get("result")
     except Exception as e:
         log.error(f"Send TX exception: {e}")
         return None
@@ -183,8 +182,7 @@ async def buy_token(session, token_addr, token_symbol):
             log.warning("Ingen quote från Jupiter")
             return None
 
-        out_amount = int(quote["outAmount"])
-        log.info(f"  → Får {out_amount} tokens för {BUY_AMOUNT_SOL} SOL")
+        log.info(f"  → Får {quote['outAmount']} tokens för {BUY_AMOUNT_SOL} SOL")
 
         swap_body = {
             "quoteResponse": quote,
@@ -208,7 +206,6 @@ async def buy_token(session, token_addr, token_symbol):
             return None
 
         tx_sig = await send_transaction(session, swap_data["swapTransaction"])
-
         if not tx_sig:
             return None
 
@@ -421,14 +418,10 @@ async def full_rugcheck(session, addr):
             non_lp = [h for h in top_holders if not h.get("isLpHolder")]
             if non_lp:
                 max_holder_pct = max(h.get("pct", 0) for h in non_lp)
-        lp_pct = 0
         markets = d.get("markets") or []
-        if markets:
-            lp_pct = min(100, round(float(markets[0].get("lpLockedPct") or 0)))
         score = 0
         if isinstance(d.get("score"), (int, float)):
             score = min(100, max(0, round(d["score"])))
-        creator_sold = d.get("creatorBalance") == "SOLD"
         risks = d.get("risks") or []
         risk_names = [r.get("name", "").lower() for r in risks]
         is_honeypot = any("honeypot" in r for r in risk_names)
@@ -438,8 +431,7 @@ async def full_rugcheck(session, addr):
 
         return {
             "score": score,
-            "lp_pct": lp_pct,
-            "creator_sold": creator_sold,
+            "creator_sold": d.get("creatorBalance") == "SOLD",
             "freeze_authority": has_freeze or has_freeze_risk,
             "mint_authority": has_mint or has_mint_risk,
             "mutable_metadata": mutable,
