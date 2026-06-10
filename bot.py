@@ -5,6 +5,7 @@ import os
 import time
 import json
 import base58
+import nacl.signing
 
 # ── CONFIG ───────────────────────────────────────────────────────────────────
 TG_TOKEN      = os.getenv("TG_TOKEN", "8908814441:AAGFGs52sINf_LjU6Mt6YP_yCcEZvQflhqM")
@@ -328,16 +329,26 @@ async def get_token_balance(session, token_addr):
     except:
         return 0
 
-def get_public_key(private_key_str):
-    """Get public key from private key."""
+def get_keypair_bytes(private_key_str):
+    """Get 64-byte keypair from private key string."""
     try:
-        from solders.keypair import Keypair
-        if len(private_key_str) > 50 and not private_key_str.startswith("["):
-            key_bytes = base58.b58decode(private_key_str)
-        else:
+        if private_key_str.startswith("["):
             key_bytes = bytes(json.loads(private_key_str))
-        kp = Keypair.from_bytes(key_bytes)
-        return str(kp.pubkey())
+        else:
+            key_bytes = base58.b58decode(private_key_str)
+        return key_bytes[:64]
+    except Exception as e:
+        log.error(f"Keypair fel: {e}")
+        return None
+
+def get_public_key(private_key_str):
+    """Get public key from private key using PyNaCl."""
+    try:
+        key_bytes = get_keypair_bytes(private_key_str)
+        if not key_bytes: return ""
+        signing_key = nacl.signing.SigningKey(key_bytes[:32])
+        pub_key_bytes = bytes(signing_key.verify_key)
+        return base58.b58encode(pub_key_bytes).decode()
     except Exception as e:
         log.error(f"Public key fel: {e}")
         return ""
