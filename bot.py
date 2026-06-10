@@ -6,6 +6,9 @@ import time
 import json
 import base58
 import nacl.signing
+import base64
+from solders.keypair import Keypair
+from solders.transaction import VersionedTransaction
 
 # ── CONFIG ───────────────────────────────────────────────────────────────────
 TG_TOKEN      = os.getenv("TG_TOKEN", "8908814441:AAGFGs52sINf_LjU6Mt6YP_yCcEZvQflhqM")
@@ -33,10 +36,10 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s", datefm
 log = logging.getLogger("pumpscan")
 
 # State
-notified     = set()
-last_check   = {}
+notified      = set()
+last_check    = {}
 active_trades = {}
-daily_loss   = 0.0
+daily_loss    = 0.0
 RECHECK_AFTER = 600
 
 def fmt(n):
@@ -49,6 +52,30 @@ def age_min(ts):
     if not ts: return 9999
     t = ts if isinstance(ts, (int, float)) else 0
     return (time.time()*1000 - t) / 60_000
+
+def get_keypair() -> Keypair:
+    """Load Keypair from private key string (base58 or JSON array)."""
+    raw = WALLET_KEY.strip()
+    if raw.startswith("["):
+        key_bytes = bytes(json.loads(raw))
+    else:
+        key_bytes = base58.b58decode(raw)
+    return Keypair.from_bytes(key_bytes[:64])
+
+def get_public_key_str() -> str:
+    try:
+        return str(get_keypair().pubkey())
+    except Exception as e:
+        log.error(f"Public key fel: {e}")
+        return ""
+
+def sign_and_encode(tx_base64: str) -> str:
+    """Sign a base64-encoded versioned transaction and return signed base64."""
+    keypair = get_keypair()
+    raw_tx = base64.b64decode(tx_base64)
+    tx = VersionedTransaction.from_bytes(raw_tx)
+    signed = VersionedTransaction(tx.message, [keypair])
+    return base64.b64encode(bytes(signed)).decode()
 
 async def send_tg(session, msg):
     try:
@@ -75,6 +102,43 @@ async def get_sol_price(session):
     except:
         return 180.0
 
+async def send_transaction(session, tx_base64: str) -> str | None:
+    """Sign and send a transaction via Helius."""
+    try:
+        signed_tx = sign_and_encode(tx_base64)
+    except Exception as e:
+        log.error(f"Signering fel: {e}")
+        return None
+
+    try:
+        async with session.post(
+            f"https://mainnet.helius-rpc.com/?api-key={HELIUS_KEY}",
+            json={
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "sendTransaction",
+                "params": [
+                    signed_tx,
+                    {
+                        "encoding": "base64",
+                        "skipPreflight": False,
+                        "preflightCommitment": "confirmed",
+                        "maxRetries": 3
+                    }
+                ]
+            },
+            timeout=aiohttp.ClientTimeout(total=30)
+        ) as r:
+            result = await r.json(content_type=None)
+            if result.get("error"):
+                log.warning(f"Send TX fel: {result['error']}")
+                return None
+            tx_sig = result.get("result")
+            return tx_sig
+    except Exception as e:
+        log.error(f"Send TX exception: {e}")
+        return None
+
 async def buy_token(session, token_addr, token_symbol):
     global daily_loss
 
@@ -87,7 +151,7 @@ async def buy_token(session, token_addr, token_symbol):
         return None
 
     if daily_loss >= DAILY_LOSS_LIMIT:
-        log.warning(f"Daglig förlustgräns nådd ({daily_loss:.3f} SOL) — stannar för idag")
+        log.warning(f"Daglig förlustgräns nådd ({daily_loss:.3f} SOL)")
         await send_tg(session,
             f"🛑 *Daglig förlustgräns nådd!*\n"
             f"Förlorat {daily_loss:.3f} SOL idag.\n"
@@ -124,7 +188,7 @@ async def buy_token(session, token_addr, token_symbol):
 
         swap_body = {
             "quoteResponse": quote,
-            "userPublicKey": get_public_key(WALLET_KEY),
+            "userPublicKey": get_public_key_str(),
             "wrapAndUnwrapSol": True,
             "computeUnitPriceMicroLamports": 50000,
         }
@@ -143,40 +207,15 @@ async def buy_token(session, token_addr, token_symbol):
             log.warning("Ingen swap transaction från Jupiter")
             return None
 
-        tx_base64 = swap_data["swapTransaction"]
+        tx_sig = await send_transaction(session, swap_data["swapTransaction"])
 
-        async with session.post(
-            f"https://mainnet.helius-rpc.com/?api-key={HELIUS_KEY}",
-            json={
-                "jsonrpc": "2.0",
-                "id": 1,
-                "method": "sendTransaction",
-                "params": [
-                    tx_base64,
-                    {
-                        "encoding": "base64",
-                        "skipPreflight": False,
-                        "preflightCommitment": "confirmed",
-                        "maxRetries": 3
-                    }
-                ]
-            },
-            timeout=aiohttp.ClientTimeout(total=30)
-        ) as r:
-            result = await r.json(content_type=None)
-            if result.get("error"):
-                log.warning(f"Send TX fel: {result['error']}")
-                return None
-            tx_sig = result.get("result")
-            if not tx_sig:
-                log.warning("Ingen TX signature")
-                return None
+        if not tx_sig:
+            return None
 
         log.info(f"  ✅ Köpt! TX: {tx_sig[:20]}...")
 
         buy_price = await get_token_price(session, token_addr)
-
-        trade = {
+        active_trades[token_addr] = {
             "buy_price": buy_price,
             "buy_price_usd": buy_price * sol_price if buy_price else 0,
             "amount_sol": BUY_AMOUNT_SOL,
@@ -185,7 +224,6 @@ async def buy_token(session, token_addr, token_symbol):
             "symbol": token_symbol,
             "tx": tx_sig,
         }
-        active_trades[token_addr] = trade
 
         return tx_sig
 
@@ -234,7 +272,7 @@ async def sell_token(session, token_addr, reason="manual", pct=100):
 
         swap_body = {
             "quoteResponse": quote,
-            "userPublicKey": get_public_key(WALLET_KEY),
+            "userPublicKey": get_public_key_str(),
             "wrapAndUnwrapSol": True,
             "computeUnitPriceMicroLamports": 50000,
         }
@@ -251,20 +289,7 @@ async def sell_token(session, token_addr, reason="manual", pct=100):
         if not swap_data.get("swapTransaction"):
             return None
 
-        tx_base64 = swap_data["swapTransaction"]
-
-        async with session.post(
-            f"https://mainnet.helius-rpc.com/?api-key={HELIUS_KEY}",
-            json={
-                "jsonrpc": "2.0",
-                "id": 1,
-                "method": "sendTransaction",
-                "params": [tx_base64, {"encoding": "base64", "skipPreflight": False}]
-            },
-            timeout=aiohttp.ClientTimeout(total=30)
-        ) as r:
-            result = await r.json(content_type=None)
-            tx_sig = result.get("result")
+        tx_sig = await send_transaction(session, swap_data["swapTransaction"])
 
         if pct == 100:
             active_trades.pop(token_addr, None)
@@ -292,7 +317,7 @@ async def get_token_price(session, token_addr):
 
 async def get_token_balance(session, token_addr):
     try:
-        pub_key = get_public_key(WALLET_KEY)
+        pub_key = get_public_key_str()
         async with session.post(
             f"https://mainnet.helius-rpc.com/?api-key={HELIUS_KEY}",
             json={
@@ -315,28 +340,6 @@ async def get_token_balance(session, token_addr):
     except:
         return 0
 
-def get_keypair_bytes(private_key_str):
-    try:
-        if private_key_str.startswith("["):
-            key_bytes = bytes(json.loads(private_key_str))
-        else:
-            key_bytes = base58.b58decode(private_key_str)
-        return key_bytes[:64]
-    except Exception as e:
-        log.error(f"Keypair fel: {e}")
-        return None
-
-def get_public_key(private_key_str):
-    try:
-        key_bytes = get_keypair_bytes(private_key_str)
-        if not key_bytes: return ""
-        signing_key = nacl.signing.SigningKey(key_bytes[:32])
-        pub_key_bytes = bytes(signing_key.verify_key)
-        return base58.b58encode(pub_key_bytes).decode()
-    except Exception as e:
-        log.error(f"Public key fel: {e}")
-        return ""
-
 async def monitor_trades(session):
     while True:
         try:
@@ -355,7 +358,7 @@ async def monitor_trades(session):
 
                 if pct_change <= -STOP_LOSS:
                     log.info(f"🛑 Stop loss triggered for {symbol}!")
-                    tx = await sell_token(session, addr, reason="stop_loss", pct=100)
+                    await sell_token(session, addr, reason="stop_loss", pct=100)
                     loss_sol = trade["amount_sol"] * STOP_LOSS
                     global daily_loss
                     daily_loss += loss_sol
@@ -369,7 +372,7 @@ async def monitor_trades(session):
 
                 elif pct_change >= TAKE_PROFIT_1 and not trade["tp1_done"]:
                     log.info(f"🎯 Take profit 1 triggered for {symbol}!")
-                    tx = await sell_token(session, addr, reason="take_profit_1", pct=50)
+                    await sell_token(session, addr, reason="take_profit_1", pct=50)
                     trade["tp1_done"] = True
                     profit_sol = trade["amount_sol"] * 0.5 * TAKE_PROFIT_1
                     await send_tg(session,
@@ -382,7 +385,7 @@ async def monitor_trades(session):
 
                 elif pct_change >= TAKE_PROFIT_2 and trade["tp1_done"]:
                     log.info(f"🚀 Take profit 2 triggered for {symbol}!")
-                    tx = await sell_token(session, addr, reason="take_profit_2", pct=100)
+                    await sell_token(session, addr, reason="take_profit_2", pct=100)
                     profit_sol = trade["amount_sol"] * TAKE_PROFIT_2
                     await send_tg(session,
                         f"🚀 *TAKE PROFIT 100% — {symbol}*\n"
@@ -466,10 +469,8 @@ async def analyze_and_buy(session, pair):
     ticker = (pair.get("baseToken") or {}).get("symbol", "?")
     liq    = (pair.get("liquidity") or {}).get("usd", 0) or 0
     vol1h  = (pair.get("volume") or {}).get("h1", 0) or 0
-    vol24h = (pair.get("volume") or {}).get("h24", 0) or 0
     buys   = (pair.get("txns") or {}).get("h1", {}).get("buys", 0) or 0
     sells  = (pair.get("txns") or {}).get("h1", {}).get("sells", 1) or 1
-    mcap   = pair.get("fdv") or pair.get("marketCap") or 0
     age    = age_min(pair.get("pairCreatedAt"))
     pct5m  = (pair.get("priceChange") or {}).get("m5", 0) or 0
     pct1h  = (pair.get("priceChange") or {}).get("h1", 0) or 0
