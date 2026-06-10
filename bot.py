@@ -15,12 +15,12 @@ WALLET_KEY    = os.getenv("WALLET_PRIVATE_KEY", "")
 SCAN_EVERY    = int(os.getenv("SCAN_EVERY", "45"))
 
 # Trading config
-BUY_AMOUNT_SOL  = float(os.getenv("BUY_AMOUNT_SOL", "0.05"))   # SOL per trade (~$10)
-MAX_TRADES      = int(os.getenv("MAX_TRADES", "3"))              # max simultaneous trades
-DAILY_LOSS_LIMIT = float(os.getenv("DAILY_LOSS_LIMIT", "0.25")) # max 0.25 SOL loss per day
-TAKE_PROFIT_1   = float(os.getenv("TAKE_PROFIT_1", "1.0"))      # sell 50% at +100%
-TAKE_PROFIT_2   = float(os.getenv("TAKE_PROFIT_2", "2.0"))      # sell rest at +200%
-STOP_LOSS       = float(os.getenv("STOP_LOSS", "0.20"))         # stop loss at -20%
+BUY_AMOUNT_SOL  = float(os.getenv("BUY_AMOUNT_SOL", "0.05"))
+MAX_TRADES      = int(os.getenv("MAX_TRADES", "3"))
+DAILY_LOSS_LIMIT = float(os.getenv("DAILY_LOSS_LIMIT", "0.25"))
+TAKE_PROFIT_1   = float(os.getenv("TAKE_PROFIT_1", "1.0"))
+TAKE_PROFIT_2   = float(os.getenv("TAKE_PROFIT_2", "2.0"))
+STOP_LOSS       = float(os.getenv("STOP_LOSS", "0.20"))
 
 # Market filters
 MIN_LIQ        = 5_000
@@ -35,7 +35,7 @@ log = logging.getLogger("pumpscan")
 # State
 notified     = set()
 last_check   = {}
-active_trades = {}   # addr -> {buy_price, amount_sol, buy_time, tp1_done}
+active_trades = {}
 daily_loss   = 0.0
 RECHECK_AFTER = 600
 
@@ -73,10 +73,9 @@ async def get_sol_price(session):
             d = await r.json(content_type=None)
             return d["solana"]["usd"]
     except:
-        return 180.0  # fallback
+        return 180.0
 
 async def buy_token(session, token_addr, token_symbol):
-    """Buy token via Jupiter API."""
     global daily_loss
 
     if not WALLET_KEY:
@@ -89,7 +88,7 @@ async def buy_token(session, token_addr, token_symbol):
 
     if daily_loss >= DAILY_LOSS_LIMIT:
         log.warning(f"Daglig förlustgräns nådd ({daily_loss:.3f} SOL) — stannar för idag")
-        await send_tg(session, 
+        await send_tg(session,
             f"🛑 *Daglig förlustgräns nådd!*\n"
             f"Förlorat {daily_loss:.3f} SOL idag.\n"
             f"Boten pausar trading tills imorgon. 🔒"
@@ -99,15 +98,12 @@ async def buy_token(session, token_addr, token_symbol):
     try:
         sol_price = await get_sol_price(session)
         buy_lamports = int(BUY_AMOUNT_SOL * 1e9)
-        
-        # WSOL mint address
         WSOL = "So11111111111111111111111111111111111111112"
-        
+
         log.info(f"💰 Köper {token_symbol} för {BUY_AMOUNT_SOL} SOL...")
-        
-        # Get quote from Jupiter
+
         async with session.get(
-            f"https://quote-api.jup.ag/v6/quote"
+            f"https://lite-api.jup.ag/swap/v1/quote"
             f"?inputMint={WSOL}"
             f"&outputMint={token_addr}"
             f"&amount={buy_lamports}"
@@ -126,7 +122,6 @@ async def buy_token(session, token_addr, token_symbol):
         out_amount = int(quote["outAmount"])
         log.info(f"  → Får {out_amount} tokens för {BUY_AMOUNT_SOL} SOL")
 
-        # Get swap transaction
         swap_body = {
             "quoteResponse": quote,
             "userPublicKey": get_public_key(WALLET_KEY),
@@ -135,7 +130,7 @@ async def buy_token(session, token_addr, token_symbol):
         }
 
         async with session.post(
-            "https://quote-api.jup.ag/v6/swap",
+            "https://lite-api.jup.ag/swap/v1/swap",
             json=swap_body,
             timeout=aiohttp.ClientTimeout(total=15)
         ) as r:
@@ -148,9 +143,8 @@ async def buy_token(session, token_addr, token_symbol):
             log.warning("Ingen swap transaction från Jupiter")
             return None
 
-        # Sign and send transaction via Helius
         tx_base64 = swap_data["swapTransaction"]
-        
+
         async with session.post(
             f"https://mainnet.helius-rpc.com/?api-key={HELIUS_KEY}",
             json={
@@ -170,21 +164,18 @@ async def buy_token(session, token_addr, token_symbol):
             timeout=aiohttp.ClientTimeout(total=30)
         ) as r:
             result = await r.json(content_type=None)
-            
             if result.get("error"):
                 log.warning(f"Send TX fel: {result['error']}")
                 return None
-                
             tx_sig = result.get("result")
             if not tx_sig:
                 log.warning("Ingen TX signature")
                 return None
 
         log.info(f"  ✅ Köpt! TX: {tx_sig[:20]}...")
-        
-        # Get current price for tracking
+
         buy_price = await get_token_price(session, token_addr)
-        
+
         trade = {
             "buy_price": buy_price,
             "buy_price_usd": buy_price * sol_price if buy_price else 0,
@@ -195,7 +186,7 @@ async def buy_token(session, token_addr, token_symbol):
             "tx": tx_sig,
         }
         active_trades[token_addr] = trade
-        
+
         return tx_sig
 
     except Exception as e:
@@ -203,18 +194,16 @@ async def buy_token(session, token_addr, token_symbol):
         return None
 
 async def sell_token(session, token_addr, reason="manual", pct=100):
-    """Sell token via Jupiter API."""
     global daily_loss
-    
+
     if token_addr not in active_trades:
         return None
-    
+
     trade = active_trades[token_addr]
-    
+
     try:
         WSOL = "So11111111111111111111111111111111111111112"
-        
-        # Get token balance
+
         balance = await get_token_balance(session, token_addr)
         if not balance or balance == 0:
             log.warning(f"Ingen balance för {token_addr[:12]}")
@@ -227,9 +216,8 @@ async def sell_token(session, token_addr, reason="manual", pct=100):
 
         log.info(f"💸 Säljer {pct}% av {trade['symbol']} — anledning: {reason}")
 
-        # Get quote
         async with session.get(
-            f"https://quote-api.jup.ag/v6/quote"
+            f"https://lite-api.jup.ag/swap/v1/quote"
             f"?inputMint={token_addr}"
             f"&outputMint={WSOL}"
             f"&amount={sell_amount}"
@@ -252,7 +240,7 @@ async def sell_token(session, token_addr, reason="manual", pct=100):
         }
 
         async with session.post(
-            "https://quote-api.jup.ag/v6/swap",
+            "https://lite-api.jup.ag/swap/v1/swap",
             json=swap_body,
             timeout=aiohttp.ClientTimeout(total=15)
         ) as r:
@@ -264,7 +252,7 @@ async def sell_token(session, token_addr, reason="manual", pct=100):
             return None
 
         tx_base64 = swap_data["swapTransaction"]
-        
+
         async with session.post(
             f"https://mainnet.helius-rpc.com/?api-key={HELIUS_KEY}",
             json={
@@ -288,7 +276,6 @@ async def sell_token(session, token_addr, reason="manual", pct=100):
         return None
 
 async def get_token_price(session, token_addr):
-    """Get current token price in SOL."""
     try:
         async with session.get(
             f"https://api.dexscreener.com/latest/dex/tokens/{token_addr}",
@@ -304,7 +291,6 @@ async def get_token_price(session, token_addr):
         return None
 
 async def get_token_balance(session, token_addr):
-    """Get token balance from wallet."""
     try:
         pub_key = get_public_key(WALLET_KEY)
         async with session.post(
@@ -330,7 +316,6 @@ async def get_token_balance(session, token_addr):
         return 0
 
 def get_keypair_bytes(private_key_str):
-    """Get 64-byte keypair from private key string."""
     try:
         if private_key_str.startswith("["):
             key_bytes = bytes(json.loads(private_key_str))
@@ -342,7 +327,6 @@ def get_keypair_bytes(private_key_str):
         return None
 
 def get_public_key(private_key_str):
-    """Get public key from private key using PyNaCl."""
     try:
         key_bytes = get_keypair_bytes(private_key_str)
         if not key_bytes: return ""
@@ -354,7 +338,6 @@ def get_public_key(private_key_str):
         return ""
 
 async def monitor_trades(session):
-    """Monitor active trades and execute stop loss / take profit."""
     while True:
         try:
             for addr in list(active_trades.keys()):
@@ -368,9 +351,8 @@ async def monitor_trades(session):
                 pct_change = (current_price - trade["buy_price"]) / trade["buy_price"]
                 symbol = trade["symbol"]
 
-                log.info(f"📊 {symbol}: {pct_change*100:.1f}% ({'+' if pct_change>=0 else ''}{pct_change*100:.1f}%)")
+                log.info(f"📊 {symbol}: {pct_change*100:.1f}%")
 
-                # Stop loss -20%
                 if pct_change <= -STOP_LOSS:
                     log.info(f"🛑 Stop loss triggered for {symbol}!")
                     tx = await sell_token(session, addr, reason="stop_loss", pct=100)
@@ -385,7 +367,6 @@ async def monitor_trades(session):
                         f"⚡ _PumpScan Bot_"
                     )
 
-                # Take profit 1 — sälj 50% vid +100%
                 elif pct_change >= TAKE_PROFIT_1 and not trade["tp1_done"]:
                     log.info(f"🎯 Take profit 1 triggered for {symbol}!")
                     tx = await sell_token(session, addr, reason="take_profit_1", pct=50)
@@ -399,7 +380,6 @@ async def monitor_trades(session):
                         f"⚡ _PumpScan Bot_"
                     )
 
-                # Take profit 2 — sälj resten vid +200%
                 elif pct_change >= TAKE_PROFIT_2 and trade["tp1_done"]:
                     log.info(f"🚀 Take profit 2 triggered for {symbol}!")
                     tx = await sell_token(session, addr, reason="take_profit_2", pct=100)
@@ -416,7 +396,7 @@ async def monitor_trades(session):
         except Exception as e:
             log.error(f"Monitor trades fel: {e}")
 
-        await asyncio.sleep(30)  # check every 30 seconds
+        await asyncio.sleep(30)
 
 async def full_rugcheck(session, addr):
     try:
@@ -469,7 +449,6 @@ async def full_rugcheck(session, addr):
         return None
 
 def is_safe(rc):
-    """Returns True only if coin passes ALL critical safety checks."""
     if rc["freeze_authority"]: return False
     if rc["mint_authority"]: return False
     if rc["is_honeypot"]: return False
@@ -480,7 +459,6 @@ def is_safe(rc):
     return True
 
 async def analyze_and_buy(session, pair):
-    """Full analysis — if GO, buy automatically."""
     addr   = (pair.get("baseToken") or {}).get("address", "")
     if not addr or addr in notified: return
 
@@ -514,11 +492,9 @@ async def analyze_and_buy(session, pair):
         log.info(f"  → NOGO säkerhet — freeze:{rc['freeze_authority']} mint:{rc['mint_authority']} honeypot:{rc['is_honeypot']}")
         return
 
-    # Only send GO — no warnings
     notified.add(addr)
     log.info(f"  → ✅ GO! Köper {name}...")
 
-    # Buy automatically
     tx_sig = await buy_token(session, addr, ticker)
 
     if tx_sig:
