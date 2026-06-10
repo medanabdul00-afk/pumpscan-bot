@@ -17,26 +17,27 @@ WALLET_KEY    = os.getenv("WALLET_PRIVATE_KEY", "")
 SCAN_EVERY    = int(os.getenv("SCAN_EVERY", "30"))
 
 # Trading config
-BUY_AMOUNT_SOL   = float(os.getenv("BUY_AMOUNT_SOL", "0.05"))
+BUY_AMOUNT_SOL   = float(os.getenv("BUY_AMOUNT_SOL", "0.1"))
 MAX_TRADES       = int(os.getenv("MAX_TRADES", "3"))
-DAILY_LOSS_LIMIT = float(os.getenv("DAILY_LOSS_LIMIT", "0.25"))
-TRAILING_STOP    = float(os.getenv("TRAILING_STOP", "0.20"))  # 20% trailing stop
+DAILY_LOSS_LIMIT = float(os.getenv("DAILY_LOSS_LIMIT", "0.5"))
+TRAILING_STOP    = float(os.getenv("TRAILING_STOP", "0.20"))
 
 # Delutgångar
-TP1_PCT   = 1.0   # +100% sälj 50%
-TP2_PCT   = 3.0   # +300% sälj 25%
-TP3_PCT   = 7.0   # +700% sälj 25% (moonbag kvar)
+TP1_PCT = 1.0
+TP2_PCT = 3.0
+TP3_PCT = 7.0
 
 # Market filters
-MIN_LIQ        = 15_000
+MIN_LIQ        = 20_000   # minst $20K likviditet
 MIN_VOL_1H     = 5_000
-MIN_BUYS_1H    = 50       # minst 50 köp senaste timmen
+MIN_BUYS_1H    = 100      # minst 100 köp
 BUY_SELL_RATIO = 2.0
 MAX_AGE_MIN    = 60
 MIN_AGE_MIN    = 5
 MIN_PCT5M      = 3.0
-MIN_MCAP       = 20_000   # min $20K mcap
-MAX_MCAP       = 500_000  # max $500K mcap
+MIN_MCAP       = 20_000
+MAX_MCAP       = 500_000
+MIN_LIQ_MCAP_RATIO = 0.15  # likviditet minst 15% av mcap
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s", datefmt="%H:%M:%S")
 log = logging.getLogger("pumpscan")
@@ -44,7 +45,7 @@ log = logging.getLogger("pumpscan")
 # State
 notified      = set()
 last_check    = {}
-active_trades = {}  # addr -> {buy_price, amount_sol, buy_time, tp1_done, tp2_done, tp3_done, peak_price, symbol, tx}
+active_trades = {}
 daily_loss    = 0.0
 RECHECK_AFTER = 600
 
@@ -119,8 +120,7 @@ async def send_transaction(session, tx_base64: str):
         async with session.post(
             f"https://mainnet.helius-rpc.com/?api-key={HELIUS_KEY}",
             json={
-                "jsonrpc": "2.0",
-                "id": 1,
+                "jsonrpc": "2.0", "id": 1,
                 "method": "sendTransaction",
                 "params": [signed_tx, {
                     "encoding": "base64",
@@ -311,7 +311,6 @@ async def get_token_balance(session, token_addr):
         return 0
 
 async def monitor_trades(session):
-    """Trailing stop + delutgångar."""
     while True:
         try:
             for addr in list(active_trades.keys()):
@@ -322,7 +321,6 @@ async def monitor_trades(session):
                 if not current_price or not trade["buy_price"]:
                     continue
 
-                # Uppdatera peak price
                 if current_price > (trade["peak_price"] or 0):
                     trade["peak_price"] = current_price
 
@@ -332,9 +330,9 @@ async def monitor_trades(session):
 
                 log.info(f"📊 {symbol}: {pct_change*100:+.1f}% (peak: {((trade['peak_price']/trade['buy_price'])-1)*100:+.1f}%)")
 
-                # Trailing stop — sälj allt om -20% från toppen
-                if pct_from_peak <= -TRAILING_STOP and pct_change > -0.15:
-                    log.info(f"📉 Trailing stop {symbol} — {pct_from_peak*100:.1f}% från toppen")
+                # Trailing stop
+                if pct_from_peak <= -TRAILING_STOP and trade["tp1_done"]:
+                    log.info(f"📉 Trailing stop {symbol}")
                     await sell_token(session, addr, reason="trailing_stop", pct=100)
                     profit_loss = trade["amount_sol"] * pct_change
                     global daily_loss
@@ -348,7 +346,7 @@ async def monitor_trades(session):
                         f"⚡ _PumpScan Bot_"
                     )
 
-                # Hårt stop loss vid -20% (om ingen pump skett)
+                # Hårt stop loss vid -20% innan TP1
                 elif pct_change <= -0.20 and not trade["tp1_done"]:
                     log.info(f"🛑 Stop loss {symbol}")
                     await sell_token(session, addr, reason="stop_loss", pct=100)
@@ -362,7 +360,7 @@ async def monitor_trades(session):
                         f"⚡ _PumpScan Bot_"
                     )
 
-                # TP1 — sälj 50% vid +100%
+                # TP1 — 50% vid +100%
                 elif pct_change >= TP1_PCT and not trade["tp1_done"]:
                     await sell_token(session, addr, reason="tp1", pct=50)
                     trade["tp1_done"] = True
@@ -374,7 +372,7 @@ async def monitor_trades(session):
                         f"⚡ _PumpScan Bot_"
                     )
 
-                # TP2 — sälj 25% vid +300%
+                # TP2 — 25% vid +300%
                 elif pct_change >= TP2_PCT and trade["tp1_done"] and not trade["tp2_done"]:
                     await sell_token(session, addr, reason="tp2", pct=50)
                     trade["tp2_done"] = True
@@ -386,7 +384,7 @@ async def monitor_trades(session):
                         f"⚡ _PumpScan Bot_"
                     )
 
-                # TP3 — sälj 25% vid +700%
+                # TP3 — 25% vid +700%
                 elif pct_change >= TP3_PCT and trade["tp2_done"] and not trade["tp3_done"]:
                     await sell_token(session, addr, reason="tp3", pct=50)
                     trade["tp3_done"] = True
@@ -419,8 +417,8 @@ async def full_rugcheck(session, addr):
         mint_auth = d.get("mintAuthority") or d.get("mint_authority")
         has_mint = mint_auth not in [None, "", "null"]
         mutable = d.get("mutableMetadata") or False
-        top_holders = d.get("topHolders") or []
 
+        top_holders = d.get("topHolders") or []
         max_holder_pct = 0
         top10_pct = 0
         non_lp = [h for h in top_holders if not h.get("isLpHolder")]
@@ -429,10 +427,9 @@ async def full_rugcheck(session, addr):
             top10_pct = sum(h.get("pct", 0) for h in non_lp[:10])
 
         markets = d.get("markets") or []
-        lp_locked = False
+        lp_pct = 0
         if markets:
             lp_pct = float(markets[0].get("lpLockedPct") or 0)
-            lp_locked = lp_pct >= 80  # minst 80% LP låst
 
         score = 0
         if isinstance(d.get("score"), (int, float)):
@@ -452,7 +449,7 @@ async def full_rugcheck(session, addr):
             "mutable_metadata": mutable,
             "max_holder_pct": max_holder_pct,
             "top10_pct": top10_pct,
-            "lp_locked": lp_locked,
+            "lp_pct": lp_pct,
             "is_honeypot": is_honeypot,
             "high_risks": high_risks,
         }
@@ -460,16 +457,20 @@ async def full_rugcheck(session, addr):
         log.warning(f"RugCheck fel: {e}")
         return None
 
-def is_safe(rc):
+def is_safe(rc, liq, mcap):
     if rc["freeze_authority"]: return False
     if rc["mint_authority"]: return False
     if rc["is_honeypot"]: return False
     if rc["mutable_metadata"]: return False
-    if rc["max_holder_pct"] > 10: return False   # dev wallet max 10%
-    if rc["top10_pct"] > 50: return False         # top 10 max 50%
-    if not rc["lp_locked"]: return False          # LP måste vara låst
+    if rc["max_holder_pct"] > 10: return False      # dev max 10%
+    if rc["top10_pct"] > 50: return False            # top10 max 50%
     if len(rc["high_risks"]) > 0: return False
-    if rc["score"] < 50: return False
+    if rc["score"] < 40: return False
+
+    # Mjuka LP-krav istället för hårt lås-krav
+    if liq < MIN_LIQ: return False                   # minst $20K liq
+    if mcap > 0 and liq / mcap < MIN_LIQ_MCAP_RATIO: return False  # liq/mcap ratio
+
     return True
 
 async def analyze_and_buy(session, pair):
@@ -506,8 +507,8 @@ async def analyze_and_buy(session, pair):
         log.info(f"  → Ingen RugCheck — skippar")
         return
 
-    if not is_safe(rc):
-        log.info(f"  → NOGO — dev:{rc['max_holder_pct']:.0f}% top10:{rc['top10_pct']:.0f}% lp_locked:{rc['lp_locked']} score:{rc['score']}")
+    if not is_safe(rc, liq, mcap):
+        log.info(f"  → NOGO — dev:{rc['max_holder_pct']:.0f}% top10:{rc['top10_pct']:.0f}% lp:{rc['lp_pct']:.0f}% score:{rc['score']}")
         return
 
     notified.add(addr)
@@ -517,15 +518,18 @@ async def analyze_and_buy(session, pair):
 
     if tx_sig:
         sol_price = await get_sol_price(session)
+        liq_mcap = f"{(liq/mcap*100):.0f}%" if mcap > 0 else "N/A"
         await send_tg(session,
             f"🔥 *KÖPT: {name}* (${ticker})\n"
             f"⏱ {age:.0f} min | Raydium\n\n"
             f"💰 {BUY_AMOUNT_SOL} SOL (${BUY_AMOUNT_SOL*sol_price:.0f})\n"
-            f"💧 Liq: {fmt(liq)} | MCap: {fmt(mcap)}\n"
+            f"💧 Liq: {fmt(liq)} ({liq_mcap} av MCap)\n"
+            f"📊 MCap: {fmt(mcap)}\n"
             f"📈 Vol 1h: {fmt(vol1h)} | Köp: {buys}\n"
-            f"📊 +{pct5m:.1f}% (5min) | Ratio: {ratio:.1f}x\n"
-            f"🛡 Score: {rc['score']}/100 | LP låst: ✅\n\n"
-            f"🎯 TP1: +100% (50%) → TP2: +300% (25%) → TP3: +700% (25%)\n"
+            f"🔄 Ratio: {ratio:.1f}x | +{pct5m:.1f}% (5min)\n"
+            f"🛡 Score: {rc['score']}/100\n"
+            f"👛 Dev: {rc['max_holder_pct']:.0f}% | Top10: {rc['top10_pct']:.0f}%\n\n"
+            f"🎯 TP1: +100% | TP2: +300% | TP3: +700%\n"
             f"📉 Trailing stop: -20% från topp\n\n"
             f"🔗 [Dexscreener](https://dexscreener.com/solana/{addr})\n\n"
             f"⚡ _PumpScan Bot v5_"
@@ -619,14 +623,14 @@ async def main():
         sol_price = await get_sol_price(session)
         await send_tg(session,
             f"🤖 *PumpScan Bot v5 — Smart Edition*\n\n"
-            f"🎯 Raydium | MCap $20K-$500K\n"
+            f"🎯 Raydium | MCap {fmt(MIN_MCAP)}-{fmt(MAX_MCAP)}\n"
             f"💰 Per trade: {BUY_AMOUNT_SOL} SOL (${BUY_AMOUNT_SOL*sol_price:.0f})\n"
             f"📊 Max trades: {MAX_TRADES}\n"
             f"📉 Trailing stop: -{TRAILING_STOP*100:.0f}% från topp\n"
             f"🎯 TP1: +100% | TP2: +300% | TP3: +700%\n"
-            f"🔒 LP måste vara låst\n"
+            f"💧 Min liq: {fmt(MIN_LIQ)} | Liq/MCap: {MIN_LIQ_MCAP_RATIO*100:.0f}%\n"
             f"👛 Dev max 10% | Top10 max 50%\n"
-            f"📈 Min 50 köp/timme\n\n"
+            f"📈 Min {MIN_BUYS_1H} köp/timme\n\n"
             f"⚡ _PumpScan Bot v5_"
         )
         await asyncio.gather(
