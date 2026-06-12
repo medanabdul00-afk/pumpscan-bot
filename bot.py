@@ -27,17 +27,17 @@ TP1_PCT = 1.0
 TP2_PCT = 3.0
 TP3_PCT = 7.0
 
-# Market filters
-MIN_LIQ        = 20_000   # minst $20K likviditet
-MIN_VOL_1H     = 5_000
-MIN_BUYS_1H    = 100      # minst 100 köp
-BUY_SELL_RATIO = 2.0
-MAX_AGE_MIN    = 60
-MIN_AGE_MIN    = 5
-MIN_PCT5M      = 3.0
-MIN_MCAP       = 20_000
-MAX_MCAP       = 500_000
-MIN_LIQ_MCAP_RATIO = 0.15  # likviditet minst 15% av mcap
+# Market filters — justerade
+MIN_LIQ            = 10_000
+MIN_VOL_1H         = 2_000
+MIN_BUYS_1H        = 30
+BUY_SELL_RATIO     = 2.0
+MAX_AGE_MIN        = 90
+MIN_AGE_MIN        = 3
+MIN_PCT5M          = 1.0
+MIN_MCAP           = 20_000
+MAX_MCAP           = 500_000
+MIN_LIQ_MCAP_RATIO = 0.10
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s", datefmt="%H:%M:%S")
 log = logging.getLogger("pumpscan")
@@ -330,7 +330,6 @@ async def monitor_trades(session):
 
                 log.info(f"📊 {symbol}: {pct_change*100:+.1f}% (peak: {((trade['peak_price']/trade['buy_price'])-1)*100:+.1f}%)")
 
-                # Trailing stop
                 if pct_from_peak <= -TRAILING_STOP and trade["tp1_done"]:
                     log.info(f"📉 Trailing stop {symbol}")
                     await sell_token(session, addr, reason="trailing_stop", pct=100)
@@ -346,7 +345,6 @@ async def monitor_trades(session):
                         f"⚡ _PumpScan Bot_"
                     )
 
-                # Hårt stop loss vid -20% innan TP1
                 elif pct_change <= -0.20 and not trade["tp1_done"]:
                     log.info(f"🛑 Stop loss {symbol}")
                     await sell_token(session, addr, reason="stop_loss", pct=100)
@@ -360,7 +358,6 @@ async def monitor_trades(session):
                         f"⚡ _PumpScan Bot_"
                     )
 
-                # TP1 — 50% vid +100%
                 elif pct_change >= TP1_PCT and not trade["tp1_done"]:
                     await sell_token(session, addr, reason="tp1", pct=50)
                     trade["tp1_done"] = True
@@ -372,7 +369,6 @@ async def monitor_trades(session):
                         f"⚡ _PumpScan Bot_"
                     )
 
-                # TP2 — 25% vid +300%
                 elif pct_change >= TP2_PCT and trade["tp1_done"] and not trade["tp2_done"]:
                     await sell_token(session, addr, reason="tp2", pct=50)
                     trade["tp2_done"] = True
@@ -384,7 +380,6 @@ async def monitor_trades(session):
                         f"⚡ _PumpScan Bot_"
                     )
 
-                # TP3 — 25% vid +700%
                 elif pct_change >= TP3_PCT and trade["tp2_done"] and not trade["tp3_done"]:
                     await sell_token(session, addr, reason="tp3", pct=50)
                     trade["tp3_done"] = True
@@ -462,15 +457,12 @@ def is_safe(rc, liq, mcap):
     if rc["mint_authority"]: return False
     if rc["is_honeypot"]: return False
     if rc["mutable_metadata"]: return False
-    if rc["max_holder_pct"] > 10: return False      # dev max 10%
-    if rc["top10_pct"] > 50: return False            # top10 max 50%
+    if rc["max_holder_pct"] > 10: return False
+    if rc["top10_pct"] > 50: return False
     if len(rc["high_risks"]) > 0: return False
     if rc["score"] < 40: return False
-
-    # Mjuka LP-krav istället för hårt lås-krav
-    if liq < MIN_LIQ: return False                   # minst $20K liq
-    if mcap > 0 and liq / mcap < MIN_LIQ_MCAP_RATIO: return False  # liq/mcap ratio
-
+    if liq < MIN_LIQ: return False
+    if mcap > 0 and liq / mcap < MIN_LIQ_MCAP_RATIO: return False
     return True
 
 async def analyze_and_buy(session, pair):
@@ -508,7 +500,7 @@ async def analyze_and_buy(session, pair):
         return
 
     if not is_safe(rc, liq, mcap):
-        log.info(f"  → NOGO — dev:{rc['max_holder_pct']:.0f}% top10:{rc['top10_pct']:.0f}% lp:{rc['lp_pct']:.0f}% score:{rc['score']}")
+        log.info(f"  → NOGO — dev:{rc['max_holder_pct']:.0f}% top10:{rc['top10_pct']:.0f}% score:{rc['score']}")
         return
 
     notified.add(addr)
@@ -628,7 +620,7 @@ async def main():
             f"📊 Max trades: {MAX_TRADES}\n"
             f"📉 Trailing stop: -{TRAILING_STOP*100:.0f}% från topp\n"
             f"🎯 TP1: +100% | TP2: +300% | TP3: +700%\n"
-            f"💧 Min liq: {fmt(MIN_LIQ)} | Liq/MCap: {MIN_LIQ_MCAP_RATIO*100:.0f}%\n"
+            f"💧 Min liq: {fmt(MIN_LIQ)}\n"
             f"👛 Dev max 10% | Top10 max 50%\n"
             f"📈 Min {MIN_BUYS_1H} köp/timme\n\n"
             f"⚡ _PumpScan Bot v5_"
