@@ -1,1 +1,2 @@
-worker: python wallet_follower.py
+worker: worker: python wallet_follower.py
+
